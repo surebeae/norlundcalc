@@ -90,3 +90,8 @@ $${}^{(1,\infty)}\nabla_{1,1}^{-1} \mathrm{arctanh}\sqrt{z} \delta z = -\frac{i\
 Truncating after a finite number of terms provides a highly accurate seed on a compact interval which can be extended by recurrance just like all other methods.
 
 For the series expansions, <https://github.com/ChristopherRabotin/hyperdual> or similar will probably be added. Highly accurate generalised Bernoulli polynomials or Hurwitz zeta will need to be added, too.
+
+## Examples
+
+Indefinite sum of sin(z*z) (default)
+![sin(z^2)](indefinite_sum.png)
