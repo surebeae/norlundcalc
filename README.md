@@ -133,7 +133,7 @@ On UN*X-likes, the binary is at `target/release/norlundcalc`. On W\*ndows, it is
 
 ### Basic example
 
-```bash
+```sh
 cargo run --release -- --function "sin(z*z)" --xmin -4 --xmax 19
 ```
 
@@ -145,12 +145,12 @@ Currently, h is both the point at which F vanishes *and* the start of [h] (the l
 The same summand can have several distinct Nørlund principal solutions due to singularities and the recurrence.  
 Changing `h` selects the strip that contains the base interval `[h, h+S]`.
 
-```bash
+```sh
 # Sum 1/z with h = -2 (strip containing negative reals)
 cargo run --release -- --function "1/z" --xmin -4.44 --xmax 4.44 --h -2
 ```
 
-```bash
+```sh
 # Sum 1/z with default auto-h (incidentally chooses the positive reals strip)
 cargo run --release -- --function "1/z" --xmin -4.44 --xmax 4.44
 ```
@@ -158,7 +158,7 @@ cargo run --release -- --function "1/z" --xmin -4.44 --xmax 4.44
 Another nice example is `exp(1/(z-1))` – it has an essential singularity at real part `z=1`.  
 Those shifts yield two completely independent principal solutions which lie on *separate* Riemann surfaces:
 
-```bash
+```sh
 # Left of the singularity
 cargo run --release -- --function "E^(1/(z-1))"
 # Auto-h finds h = -0.5
@@ -174,7 +174,7 @@ Both are valid Nørlund principal solutions, each analytic on its own respective
 The `--S` (or `--step`) parameter generalises the operator to step sizes other than 1.  
 For instance, `--S 2` computes the sum over every second integer:
 
-```bash
+```sh
 cargo run --release -- --function "1/z" --xmin -4.44 --xmax 4.44 --S 2
 ```
 
@@ -185,14 +185,14 @@ These methods (Abel–Plana, series expansion) are generic. There are CAS-like b
 The Abel–Plana seed strip only needs the function to be analytic and of exponential type < 2π (assuming S=1) on the **base strip**.  
 It doesn't care about global behaviour or poles, which is entirely handled via recurrence. This allows antidifferencing the grand majority of things, including that which is not solvable via hypergeometric means (e.g. Karr, Gosper, etc.), as the requirement of being clean on the interval [h,h+S] is satisfied by the grand majority of functions which are holomorphic or meromorphic (we cannot do things with compact poles, e.g. the Lacunary function, because the poles block us from assessing our growth in the imaginary direction, and we are also stopped by pure resonance if it happens)
 
-```bash
+```sh
 cargo run --release -- --function "sin(E^z)"
 cargo run --release -- --function "E^(E^(E^z))"
 ```
 
 Even `atanh(z)` – whose branch cut excludes the whole real line except (-1,1) – is handled automatically:
 
-```bash
+```sh
 cargo run --release -- --function "atanh(z)"
 # Auto-h finds h = -0.5, leaving the strip safely inside the analytic region.
 ```
