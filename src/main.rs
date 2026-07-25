@@ -932,15 +932,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ScatterPlot::new().with_data(disc_real_cropped).with_color("#EC9E9E").into(),
         ScatterPlot::new().with_data(disc_imag_cropped).with_color("#37BBBF").into(),
     ];
-    let mut layout = Layout::new((args.xmin, args.xmax), (y_lo, y_hi))
+    let layout = Layout::new((args.xmin, args.xmax), (y_lo, y_hi))
         .with_title("Σ f(S·k+h) — term-wise (lines) & integer sums (dots) [F(h)=0]")
         .with_x_label("x").with_y_label("Σ f(S·k+h)")
         .with_width(2400.0).with_height(1600.0)
         .with_x_axis_min(args.xmin).with_x_axis_max(args.xmax)
-        .with_y_axis_min(y_lo).with_y_axis_max(y_hi);
-    layout.theme = theme;
+        .with_y_axis_min(y_lo).with_y_axis_max(y_hi)
+        .with_theme(theme);
 
-    let png_bytes = render_to_png(plots, layout, 1.0)?;
+    let png_bytes = kuva::render_to_raster(plots, layout, 2.0)?;
     std::fs::write("indefinite_sum.png", &png_bytes)?;
     println!("PNG saved to indefinite_sum.png");
 
