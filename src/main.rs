@@ -564,7 +564,7 @@ fn passes_decay_test<F: Fn(Complex<f64>) -> Complex<f64> + Sync>(
     true
 }
 
-// Candidate validation sub-checks (refactored)
+// Candidate validation sub-checks
 
 fn validate_strip_safety<F: Fn(Complex<f64>) -> Complex<f64> + Sync>(
     f: &F,
@@ -632,15 +632,17 @@ fn validate_self_consistency<F: Fn(Complex<f64>) -> Complex<f64> + Sync>(
     true
 }
 
+/// Check for jump discontinuities at the strip boundaries `h + m*S`.
+/// Rejects the strip if the relative jump exceeds 0.5% of the local magnitude.
 fn validate_jump_discontinuities<F: Fn(Complex<f64>) -> Complex<f64> + Sync>(
     f: &F,
     h: f64,
     s: f64,
     sum_op: &IndefiniteSum<impl Fn(Complex<f64>) -> Complex<f64> + Sync>,
-    verbose: bool,
 ) -> bool {
-    let epsilon = 1e-6;
+    let epsilon = 1e-4;
     for m in 1..=4 {
+        // Skip if f has a pole on the real axis at the check point.
         let mut sum_has_pole = false;
         for k in 1..=m {
             let val = f(Complex::new(h + k as f64 * s, 0.0));
@@ -662,26 +664,28 @@ fn validate_jump_discontinuities<F: Fn(Complex<f64>) -> Complex<f64> + Sync>(
         {
             continue;
         }
-        let f_plus  = sum_op.eval_complex((base + epsilon - h) / s);
+
+        let f_plus = sum_op.eval_complex((base + epsilon - h) / s);
         let f_minus = sum_op.eval_complex((base - epsilon - h) / s);
         if !f_plus.re.is_finite() || !f_minus.re.is_finite() {
-            if verbose { println!("    [fail] F non-finite near offset {}", m); }
             return false;
         }
         if f_plus.norm() >= 1e6 || f_minus.norm() >= 1e6 {
             continue;
         }
+
         let diff = (f_plus - f_minus).norm();
         let scale = f_plus.norm().max(f_minus.norm()).max(1.0);
-        if diff > 1e-3 * scale && diff > 1e-2 {
-            if verbose {
-                println!("    [fail] jump discontinuity near offset {} (diff={:.3e})", m, diff);
-            }
+        let relative_diff = diff / scale.max(1e-12);
+
+        // Reject if relative jump exceeds 0.5%.
+        if relative_diff > 5e-3 {
             return false;
         }
     }
     true
 }
+
 
 fn validate_discrete_sums<F: Fn(Complex<f64>) -> Complex<f64> + Sync>(
     f: &F,
@@ -754,7 +758,7 @@ where
     if !validate_self_consistency(f_user, h, s, &sum_op, verbose) {
         return false;
     }
-    if !validate_jump_discontinuities(f_user, h, s, &sum_op, verbose) {
+    if !validate_jump_discontinuities(f_user, h, s, &sum_op) {
         return false;
     }
     if !validate_discrete_sums(f_user, h, s, &sum_op, verbose) {
