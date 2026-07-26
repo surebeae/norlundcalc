@@ -541,7 +541,7 @@ fn strip_is_safe<F: Fn(Complex<f64>) -> Complex<f64> + Sync>(
 /// Check exponential type on a set of x-positions.
 fn passes_decay_test<F: Fn(Complex<f64>) -> Complex<f64> + Sync>(
     f: &F,
-    h: f64,
+    _h: f64,
     s: f64,
     x_points: &[f64],
     y_values: &[f64],
