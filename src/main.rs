@@ -492,6 +492,32 @@ fn strip_has_singularity<F: Fn(Complex<f64>) -> Complex<f64> + Sync>(
     false
 }
 
+fn strip_has_pole_near_axis<F: Fn(Complex<f64>) -> Complex<f64> + Sync>(
+    f: &F,
+    h: f64,
+    s: f64,
+    verbose: bool,
+) -> bool {
+    let n_x = 10;
+    let y_range = 6.0;
+    let y_step = 0.02;
+    for i in 0..=n_x {
+        let x = h + s * (i as f64 / n_x as f64);
+        let mut y = -y_range;
+        while y <= y_range {
+            let val = f(Complex::new(x, y));
+            if !val.re.is_finite() || !val.im.is_finite() || val.norm() > 1e10 {
+                if verbose {
+                    println!("        [pole detected] at ({:.6},{:.6})", x, y);
+                }
+                return true;
+            }
+            y += y_step;
+        }
+    }
+    false
+}
+
 fn strip_is_safe<F: Fn(Complex<f64>) -> Complex<f64> + Sync>(
     f: &F,
     h: f64,
@@ -500,6 +526,11 @@ fn strip_is_safe<F: Fn(Complex<f64>) -> Complex<f64> + Sync>(
     verbose: bool,
 ) -> bool {
     if strip_has_singularity(f, h, s, verbose) {
+        return false;
+    }
+
+    if strip_has_pole_near_axis(f, h, s, verbose) {
+        if verbose { println!("    [fail] pole found near real axis inside strip"); }
         return false;
     }
 
@@ -791,6 +822,7 @@ where
     if verbose { println!("  trying random shifts in [-30, 30] …"); }
     let mut seed = 12345u64;
     for _ in 0..50 {
+        // https://en.wikipedia.org/wiki/Permuted_congruential_generator
         seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
         let h = -30.0 + (seed as f64 / u64::MAX as f64) * 60.0;
         if verbose { print!("  trying h = {:>6.2} ... ", h); }
