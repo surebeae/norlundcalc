@@ -117,7 +117,7 @@ Then build:
 cargo build --release
 ```
 
-On UN*X-likes, the binary is at `target/release/norlundcalc`. On W*ndows, it is at `target/release/norlundcalc.exe` (you will need to run the executable from command prompt [`cmd`]).
+On UN\*X-likes, the binary is at `target/release/norlundcalc`. On W\*ndows, it is at `target/release/norlundcalc.exe` (you will need to run the executable from command prompt [`cmd`]).
 
 ## Usage
 
