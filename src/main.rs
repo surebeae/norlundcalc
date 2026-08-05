@@ -201,18 +201,21 @@ fn try_closed_form(f_str: &str, s: f64, h: f64) -> Option<Box<dyn Fn(f64) -> Com
         }
     }
 
-    if let Some((base, _)) = expr.split_once('^') {
-        if let Ok(a) = base.trim().parse::<f64>() {
-            if a > 0.0 && (a - 1.0).abs() > 1e-12 {
-                let ln_a = a.ln();
-                let a_s = ln_a * s;
-                let ea_s = a_s.exp();
-                if (ea_s - 1.0).abs() < 1e-12 { return None; }
-                return Some(Box::new(move |x: f64| {
-                    let t = (x - h) / s;
-                    let sum = (ln_a * h).exp() * (ea_s * (a_s * t).exp() - ea_s) / (ea_s - 1.0);
-                    Complex::new(sum, 0.0)
-                }));
+    // Parse the exponent as b*z and apply a^(b*z) = exp(b*ln(a)*z)
+    if let Some((base_str, exp_str)) = expr.split_once('^') {
+        if let Ok(base) = base_str.trim().parse::<f64>() {
+            if base > 0.0 {
+                if let Some(b) = parse_linear_coeff(exp_str.trim()) {
+                    let c = b * base.ln();
+                    let c_s = c * s;
+                    let ec_s = c_s.exp();
+                    if (ec_s - 1.0).abs() < 1e-12 { return None; }
+                    return Some(Box::new(move |x: f64| {
+                        let t = (x - h) / s;
+                        let sum = (c * h).exp() * (ec_s * (c_s * t).exp() - ec_s) / (ec_s - 1.0);
+                        Complex::new(sum, 0.0)
+                    }));
+                }
             }
         }
     }
@@ -315,14 +318,6 @@ impl CubicSpline {
         let a = 1.0 - t;
         let b = t;
         a * ys[i] + b * ys[i + 1] + (h * h / 6.0) * ((a * a * a - a) * zs[i] + (b * b * b - b) * zs[i + 1])
-    }
-
-    fn knots(&self) -> (&[f64], Vec<Complex<f64>>) {
-        let ys: Vec<Complex<f64>> = self.ys_real.iter()
-            .zip(&self.ys_imag)
-            .map(|(&re, &im)| Complex::new(re, im))
-            .collect();
-        (&self.xs, ys)
     }
 }
 
@@ -439,10 +434,6 @@ where
         raw_eval(&self.f, self.h, &self.spline, x)
             .map(|raw| raw - self.c)
             .unwrap_or(Complex::new(f64::NAN, f64::NAN))
-    }
-
-    pub fn spline_knots(&self) -> (&[f64], Vec<Complex<f64>>) {
-        self.spline.knots()
     }
 }
 
@@ -717,7 +708,6 @@ fn validate_jump_discontinuities<F: Fn(Complex<f64>) -> Complex<f64> + Sync>(
     true
 }
 
-
 fn validate_discrete_sums<F: Fn(Complex<f64>) -> Complex<f64> + Sync>(
     f: &F,
     h: f64,
@@ -882,7 +872,6 @@ fn split_into_terms(expr: &str) -> Vec<(f64, String)> {
 // Per-term sum builder
 
 struct TermSum {
-    h: f64,
     sum_eval: Box<dyn Fn(f64) -> Complex<f64> + Sync + Send>,
     f_raw: Arc<dyn Fn(Complex<f64>) -> Complex<f64> + Sync + Send>,
 }
@@ -895,7 +884,7 @@ fn build_term_sum(
             FormulaBuilder::<f64, 1>::new(orig_str, ["z"]).compile().ok()?
         );
         let f_raw = Arc::new({ let c = Arc::clone(&compiled_raw); move |z| c([z]) });
-        return Some(TermSum { h: h_global, sum_eval: cf_eval, f_raw });
+        return Some(TermSum { sum_eval: cf_eval, f_raw });
     }
 
     let analytic_expr = preprocess_function(orig_str);
@@ -928,20 +917,50 @@ fn build_term_sum(
     let sum_eval = Box::new(move |x: f64| { let z = (x - best_h) / s; sum_op.eval_complex(z) });
     let f_raw = Arc::new(f_term);
 
-    Some(TermSum { h: best_h, sum_eval, f_raw })
+    Some(TermSum { sum_eval, f_raw })
+}
+
+fn auto_find_a(
+    g_eval: &(impl Fn(f64) -> Complex<f64> + Sync),
+    xmin: f64, xmax: f64, fallback_h: f64,
+) -> f64 {
+    let mut n = 0;
+    loop {
+        let candidate = if n == 0 { 0.0 } else {
+            let sign = if n % 2 == 0 { 1.0 } else { -1.0 };
+            sign * ((n + 1) / 2) as f64
+        };
+        if candidate < xmin - 10.0 || candidate > xmax + 10.0 {
+            eprintln!("Warning: no finite integer zero point found within plot range; falling back to h = {fallback_h}.");
+            return fallback_h;
+        }
+        let val = g_eval(candidate);
+        if val.re.is_finite() && val.im.is_finite() { return candidate; }
+        n += 1;
+        if n > 1000 {
+            eprintln!("Warning: searched 1000 candidates, none finite; falling back to h = {fallback_h}.");
+            return fallback_h;
+        }
+    }
 }
 
 // CLI
 
 struct CliArgs {
-    h: Option<f64>, step: f64, function: String,
-    xmin: f64, xmax: f64, ymin: Option<f64>, ymax: Option<f64>,
-    no_display: bool, force: bool,
+    h: Option<f64>,
+    a: Option<f64>,
+    step: f64,
+    function: String,
+    xmin: f64, xmax: f64,
+    ymin: Option<f64>, ymax: Option<f64>,
+    no_display: bool,
+    force: bool,
 }
 
 fn parse_args() -> CliArgs {
     let args: Vec<String> = std::env::args().collect();
     let mut h = None;
+    let mut a = None;
     let mut step = 1.0;
     let mut function = "sin(z*z)".to_string();
     let mut xmin = -4.0;
@@ -953,20 +972,77 @@ fn parse_args() -> CliArgs {
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
-            "--h" => { i += 1; h = Some(args[i].parse().expect("invalid h")); }
-            "--step" | "--S" => { i += 1; step = args[i].parse().expect("invalid step size"); }
-            "--function" | "-f" => { i += 1; function = args[i].clone(); }
-            "--xmin" => { i += 1; xmin = args[i].parse().expect("invalid xmin"); }
-            "--xmax" => { i += 1; xmax = args[i].parse().expect("invalid xmax"); }
-            "--ymin" => { i += 1; ymin = Some(args[i].parse().expect("invalid ymin")); }
-            "--ymax" => { i += 1; ymax = Some(args[i].parse().expect("invalid ymax")); }
+            "--h" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("Error: --h requires a value");
+                    std::process::exit(1);
+                }
+                h = Some(args[i].parse().expect("invalid h"));
+            }
+            "--a" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("Error: --a requires a value");
+                    std::process::exit(1);
+                }
+                a = Some(args[i].parse().expect("invalid a"));
+            }
+            "--step" | "--S" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("Error: --step/--S requires a value");
+                    std::process::exit(1);
+                }
+                step = args[i].parse().expect("invalid step size");
+            }
+            "--function" | "-f" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("Error: --function/-f requires an expression");
+                    std::process::exit(1);
+                }
+                function = args[i].clone();
+            }
+            "--xmin" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("Error: --xmin requires a value");
+                    std::process::exit(1);
+                }
+                xmin = args[i].parse().expect("invalid xmin");
+            }
+            "--xmax" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("Error: --xmax requires a value");
+                    std::process::exit(1);
+                }
+                xmax = args[i].parse().expect("invalid xmax");
+            }
+            "--ymin" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("Error: --ymin requires a value");
+                    std::process::exit(1);
+                }
+                ymin = Some(args[i].parse().expect("invalid ymin"));
+            }
+            "--ymax" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("Error: --ymax requires a value");
+                    std::process::exit(1);
+                }
+                ymax = Some(args[i].parse().expect("invalid ymax"));
+            }
             "--no-display" => no_display = true,
             "--force" => force = true,
             _ => { eprintln!("Unknown argument: {}", args[i]); std::process::exit(1); }
         }
         i += 1;
     }
-    CliArgs { h, step, function, xmin, xmax, ymin, ymax, no_display, force }
+    CliArgs { h, a, step, function, xmin, xmax, ymin, ymax, no_display, force }
 }
 
 // Main
@@ -995,7 +1071,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             0.0
         })
     };
-    println!("Using global shift h = {global_h}");
+    println!("Using global strip anchor h = {global_h}");
     let fixed_h = args.h.is_some();
 
     let mut term_sums_vec: Vec<(f64, TermSum)> = Vec::new();
@@ -1012,7 +1088,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let term_sums = Arc::new(term_sums_vec);
     let term_sums_clone = Arc::clone(&term_sums);
-    let combined_eval = move |x: f64| -> Complex<f64> {
+    let g_eval = move |x: f64| -> Complex<f64> {
         let mut total = Complex::new(0.0, 0.0);
         for (coeff, ts) in term_sums_clone.iter() {
             let val = (ts.sum_eval)(x);
@@ -1025,48 +1101,88 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         total
     };
 
+    let f_eval = {
+        let terms = Arc::clone(&term_sums);
+        move |z: Complex<f64>| -> Complex<f64> {
+            let mut total = Complex::new(0.0, 0.0);
+            for (coeff, ts) in terms.iter() {
+                let val = (ts.f_raw)(z);
+                if val.re.is_finite() && val.im.is_finite() { total += coeff * val; }
+                else { return Complex::new(f64::NAN, f64::NAN); }
+            }
+            total
+        }
+    };
+
+    let zero_point_a = if let Some(user_a) = args.a {
+        let val = g_eval(user_a);
+        if val.re.is_finite() && val.im.is_finite() { user_a }
+        else {
+            eprintln!("Warning: user-specified a = {user_a} is singular; searching for a finite integer zero point.");
+            auto_find_a(&g_eval, args.xmin, args.xmax, global_h)
+        }
+    } else {
+        auto_find_a(&g_eval, args.xmin, args.xmax, global_h)
+    };
+    println!("Using zero point a = {zero_point_a}");
+
+    let g_at_a = g_eval(zero_point_a);
+    if !g_at_a.re.is_finite() || !g_at_a.im.is_finite() {
+        eprintln!("Error: G(a) is not finite at a = {zero_point_a}. This should not happen after validation.");
+        std::process::exit(1);
+    }
+
+    let final_eval = move |x: f64| -> Complex<f64> {
+        let gx = g_eval(x);
+        if gx.re.is_finite() && gx.im.is_finite() { gx - g_at_a }
+        else { Complex::new(f64::NAN, f64::NAN) }
+    };
+
     let step = 0.001;
     let n_steps = ((args.xmax - args.xmin) / step) as usize;
     let real_points: Vec<(f64, f64)> = (0..=n_steps).into_par_iter().map(|i| {
         let x = args.xmin + i as f64 * step;
-        let y = combined_eval(x).re;
+        let y = final_eval(x).re;
         (x, if y.is_finite() { y } else { f64::NAN })
     }).collect();
     let imag_points: Vec<(f64, f64)> = (0..=n_steps).into_par_iter().map(|i| {
         let x = args.xmin + i as f64 * step;
-        let y = combined_eval(x).im;
+        let y = final_eval(x).im;
         (x, if y.is_finite() { y } else { f64::NAN })
     }).collect();
 
-    let m_min = ((args.xmin - global_h) / s).ceil() as i64;
-    let m_max = ((args.xmax - global_h) / s).floor() as i64;
+    let m_min = ((args.xmin - zero_point_a) / s).ceil() as i64;
+    let m_max = ((args.xmax - zero_point_a) / s).floor() as i64;
     let mut disc_real: Vec<(f64, f64)> = Vec::new();
     let mut disc_imag: Vec<(f64, f64)> = Vec::new();
 
     for m in m_min..=m_max {
-        let x_val = global_h + m as f64 * s;
-        let mut total = Complex::new(0.0, 0.0);
-        let mut ok = true;
-        for (coeff, ts) in term_sums.iter() {
-            let n = ((x_val - ts.h) / s).round() as i64;
-            let mut term_sum = Complex::new(0.0, 0.0);
-            if n > 0 {
-                for k in 1..=n {
-                    let z = Complex::new(s * k as f64 + ts.h, 0.0);
-                    let val = (ts.f_raw)(z);
-                    if val.re.is_finite() && val.im.is_finite() {
-                        term_sum += val;
-                    } else {
-                        ok = false; break;
-                    }
-                }
+        let x_val = zero_point_a + m as f64 * s;
+        let val = if m == 0 {
+            Complex::new(0.0, 0.0)
+        } else if m > 0 {
+            let mut sum = Complex::new(0.0, 0.0);
+            let mut ok = true;
+            for k in 1..=m {
+                let fval = f_eval(Complex::new(zero_point_a + k as f64 * s, 0.0));
+                if fval.re.is_finite() && fval.im.is_finite() { sum += fval; }
+                else { ok = false; break; }
             }
-            if !ok { break; }
-            total += coeff * term_sum;
-        }
-        if ok {
-            disc_real.push((x_val, total.re));
-            disc_imag.push((x_val, total.im));
+            if ok { sum } else { continue; }
+        } else {
+            let n = -m;
+            let mut sum = Complex::new(0.0, 0.0);
+            let mut ok = true;
+            for i in 0..n {
+                let fval = f_eval(Complex::new(zero_point_a - i as f64 * s, 0.0));
+                if fval.re.is_finite() && fval.im.is_finite() { sum -= fval; }
+                else { ok = false; break; }
+            }
+            if ok { sum } else { continue; }
+        };
+        if val.re.is_finite() && val.im.is_finite() {
+            disc_real.push((x_val, val.re));
+            disc_imag.push((x_val, val.im));
         }
     }
 
@@ -1103,6 +1219,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         tick_color: "#555555".into(), text_color: "#FFFFC6".into(), legend_bg: "#CCCCCC".into(),
         legend_border: "#888888".into(), ..Theme::dark()
     };
+    let title = format!("Σ f(S·k+a) — term-wise (lines) & integer sums (dots) [F(a)=0], a={zero_point_a}");
     let plots: Vec<Plot> = vec![
         LinePlot::new().with_data(real_cropped).with_color("#EC9E9E").with_stroke_width(2.0).into(),
         LinePlot::new().with_data(imag_cropped).with_color("#37BBBF").with_stroke_width(2.0).into(),
@@ -1110,8 +1227,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ScatterPlot::new().with_data(disc_imag_cropped).with_color("#37BBBF").into(),
     ];
     let layout = Layout::new((args.xmin, args.xmax), (y_lo, y_hi))
-        .with_title("Σ f(S·k+h) — term-wise (lines) & integer sums (dots) [F(h)=0]")
-        .with_x_label("x").with_y_label("Σ f(S·k+h)")
+        .with_title(&title)
+        .with_x_label("x").with_y_label("Σ f(S·k+a)")
         .with_width(2400.0).with_height(1600.0)
         .with_x_axis_min(args.xmin).with_x_axis_max(args.xmax)
         .with_y_axis_min(y_lo).with_y_axis_max(y_hi)
