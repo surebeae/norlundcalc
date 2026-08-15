@@ -1,210 +1,314 @@
 # norlundcalc
 
-Numerically compute the Nørlund principal solution of the difference equation `F(z) - F(z-S) = f(z)` with step size `S`, strip anchor `h` (used only to select the analytic strip), and zero point `a` where `F(a)=0`.  
-Currently the binary is called `norlundcalc`. Series expansion fallback and indefinite products are planned but not yet implemented.
+Numerically compute the Nørlund principal solution of the difference equation
+
+$$
+F(z) - F(z - S) = f(z)
+$$
+
+with step size $S$, strip anchor $h$, and zero point $a$ where $F(a) = 0$.
+
+The project provides:
+
+- a command-line grapher and CSV exporter,
+- a Rust library,
+- a Python package with bindings.
+
+Indefinite products are implemented. Series-expansion fallback is planned but not yet implemented.
 
 ## Notation
 
 The indefinite sum (antidifference) operator is written as
 
-$${}^{[\text{strip}]}\nabla_{S,a}^{-1} f(x)\,\delta x \qquad\text{or}\qquad {}^{[\text{strip}]}\Delta_{S,a}^{-1} f(x)\,\delta x ,$$
+$$
+{}^{[\text{strip}]}\nabla_{S,a}^{-1} f(x)\,\delta x
+\qquad\text{or}\qquad
+{}^{[\text{strip}]}\Delta_{S,a}^{-1} f(x)\,\delta x,
+$$
 
 where
 
-* $\nabla$ / $\Delta$ – backward / forward difference operator,
-* right superscript $(-1)$ – the antidifference (inverse of the first difference) and more generally the order,
-* subscript $S$ – step size (positive real, default $1$),
-* subscript $a$ – **zero point**: the point where the solution vanishes, i.e. $F(a)=0$ (the “empty sum” reference).
-* left superscript $[\text{strip}]$ – the maximal open vertical strip in which the principal solution is pole free.  
-  It may be an explicit interval $(a,b)$, $[a,b]$, $(a,\infty)$, … or the shorthand $[h]$ meaning “the component containing the base interval $[h,h+S]$”.  
-* $\delta x$ – the summation variable (the finite differences analogue of $dx$).
+- $\nabla$ / $\Delta$ – backward / forward difference operator,
+- right superscript $(-1)$ – the antidifference,
+- subscript $S$ – step size, positive real, default $1$,
+- subscript $a$ – zero point: the point where the solution vanishes, $F(a)=0$,
+- left superscript $[\text{strip}]$ – the maximal open vertical strip in which the principal solution is pole-free,
+- $\delta x$ – the summation variable.
 
-When the step size, zero point, and strip are clear from context, the subscript may be shortened to $S$ alone,
-and the left superscript can be omitted if the function is entire or the strip is unambiguous.
+When the step size, zero point, and strip are clear from context, the subscript may be shortened to $S$ alone, and the left superscript may be omitted if the function is entire or the strip is unambiguous.
 
 **Examples**
 
-* Entire function (no singularities, entire strip): $\nabla_{1,0}^{-1} x\,\delta x = \frac{x(x+1)}{2}$.
-* With a pole free strip: ${}^{(0,\infty)}\nabla_{1,0}^{-1} \frac{1}{x^2+1}\,\delta x = \mathrm{Im}\psi(1+i)-\mathrm{Im}\psi(x+1+i)$.
+- Entire function: $\nabla_{1,0}^{-1} x\,\delta x = \frac{x(x+1)}{2}$.
+- Pole-free strip:
+  $${}^{(0,\infty)}\nabla_{1,0}^{-1} \frac{1}{x^2+1}\,\delta x = \mathrm{Im}\,\psi(1+i) - \mathrm{Im}\,\psi(x+1+i).$$
 
-In both examples the zero point is $a=0$. The program may use a different $a$ (via `--a`) for plotting; the displayed function differs by a constant.
+In both examples the zero point is $a=0$. The program may use a different $a$ via `--a`.
 
 ---
 
-See <https://www.desmos.com/calculator/anih6sjvmb?backgroundColor=bbb&textColor=235656&invertedColors> for a less robust web version.
+## Indefinite products
 
-## Example: Series Expansion for $\mathrm{arctanh}\sqrt{x}$
+With `--product`, the program computes
 
-Not every function can be done via Abel–Plana. Series expansion fallback (not yet added) can handle even the principal solutions for which we don’t have a nice step length strip for Abel–Plana. As an example, consider  
-$f(x) = \mathrm{arctanh}\sqrt{x}$ on $(0,1)$.
+$$
+G(z) - G(z - S) = \ln f(z)
+$$
 
-The domain of analyticity of $f$ is the vertical strip $0<\Re(z)<1$ (the power series converges there).  
-We denote the corresponding principal solution (strip $(0,1)$, $S=1$, $a=0$) by
+and then exponentiates:
 
-$${}^{(0,1)}\nabla_{1,0}^{-1} \mathrm{arctanh}\sqrt{x}\,\delta x = \sum_{k=1}^{x} \mathrm{arctanh}\sqrt{k}.$$
+$$
+G(z) = \exp(F(z)),
+$$
 
-Expand $\mathrm{arctanh} w$ as a power series:
+where $F$ is the Nørlund principal indefinite sum of $\ln f(z)$.
 
-$$\mathrm{arctanh} w = \sum_{n=0}^{\infty} \frac{w^{2n+1}}{2n+1},
-\quad |w| < 1.$$
+The zero point defaults to $a = 0$, so $G(0) = 1$.
 
-Substitute $w = \sqrt{x}$ to obtain
-
-$$\mathrm{arctanh} \sqrt{x} = \sum_{n=0}^{\infty} \frac{x^{n+1/2}}{2n+1}.$$
-
-The indefinite sum of a monomial $x^a$ ($a \neq -1$) with strip $(0,\infty)$ is given by
-
-$${}^{(0,\infty)}\nabla_{1,0}^{-1} x^a \,\delta x = \zeta(-a) - \zeta(-a, x+1),$$
-
-where $\zeta(s, q)$ is the Hurwitz zeta function and $\zeta(s) = \zeta(s, 1)$.  
-For the strip $(0,1)$ we must restrict to $0<\Re(x)<1$; applying the operator termwise (justified by uniform convergence on compact sets) gives
-
-$${}^{(0,1)}\nabla_{1,0}^{-1} \mathrm{arctanh}\sqrt{x} \,\delta x
-= \sum_{n=0}^{\infty} \frac{1}{2n+1}
-   \Bigl[ \zeta\bigl(-n-\tfrac12\bigr) - \zeta\bigl(-n-\tfrac12, x+1\bigr) \Bigr].$$
-
-Truncating the series after enough terms provides a high precision seed (ideally up to machine precision) on an interval inside the radius of convergence, from which we recur outwards like the current Abel–Plana methods.
-
-**Term by term summation**: The series $f(z) = \sum_m c_m (z-p)^m$ is summed as
-
-$$F(z) = \sum_{m} c_m \Bigl[\zeta(-m) - \zeta(-m, z-p+1)\Bigr] + C(x),$$
-
-where the Hurwitz zeta function handles arbitrary complex exponents. The constant must be chosen to match the selected zero point $a$ for each strip.
-
-See also <https://en.wikipedia.org/wiki/User:Sure_Beae/Math_notes>
-
-## Series Expansion for $\mathrm{arctanh}\sqrt{x}$ on $(1,\infty)$
-
-For $\Re(z)>1$ the power series used on $(0,1)$ diverges; instead we expand via
-$\mathrm{arctanh}\sqrt{z} = -\frac{i\pi}{2} + \mathrm{arccoth}\sqrt{z}$, which yields the
-convergent Laurent series
-
-$$\mathrm{arctanh}\sqrt{z} = -\frac{i\pi}{2} + \sum_{n=0}^\infty \frac{1}{2n+1} z^{-n-\frac12},\qquad \Re(z)>1 .$$
-
-Applying the inverse backward difference $\nabla^{-1}$ termwise with strip $(1,\infty)$, $S=1$, and zero point $a=1$:
-the constant $-\frac{i\pi}{2}$ sums to $-\frac{i\pi}{2}(z-1)$; a monomial $z^{-a}$ ($a>0,a\neq1$)
-with the empty sum condition $F(1)=0$ gives $\zeta(a,2)-\zeta(a,z+1)$. Hence the Nørlund principal
-solution on $(1,\infty)$ is
-
-$${}^{(1,\infty)}\nabla_{1,1}^{-1} \mathrm{arctanh}\sqrt{z} \,\delta z = -\frac{i\pi}{2}(z-1) + \sum_{n=0}^{\infty} \frac{1}{2n+1} \Bigl[ \zeta\bigl(n+\tfrac12, 2\bigr) - \zeta\bigl(n+\tfrac12, z+1\bigr) \Bigr].$$
-
-Truncating after a finite number of terms provides a highly accurate seed on a compact interval which can be extended by recurrence just like all other methods.
-
-For the series expansions, <https://github.com/ChristopherRabotin/hyperdual> or similar will probably be added. Highly accurate generalised Bernoulli polynomials or Hurwitz zeta will need to be added, too.
-
-## Examples
-
-Indefinite sum of sin(z*z) (default step S=1, zero point a automatically selected, here a = 0)
-![sin(z^2)](indefinite_sum.png)
-
-## Compilation
-
-Clone the repository using `git` or `gix` (other git tools like Game of Trees [`got`] work too):
-
-```sh
-git clone https://codeberg.org/AzulBeae/norlundcalc.git
-cd norlundcalc
-```
-
-```sh
-gix clone https://codeberg.org/AzulBeae/norlundcalc.git
-cd norlundcalc
-```
-
-Then build:
-
-```sh
-cargo build --release
-```
-
-On UN\*X-likes, the binary is at `target/release/norlundcalc`. On W\*ndows, it is at `target/release/norlundcalc.exe` (you will need to run the executable from command prompt [`cmd`]).
-
-## Usage
+Example:
 
 ```
-  --h <value>           Strip anchor h: the Abel–Plana integration base interval is [h, h+S].
-                        The solution is analytic in the maximal strip containing this interval.
-                        Auto detected if omitted.
-  --a <value>           Zero point a: the output function satisfies F(a) = 0.
-                        Auto detected as a finite integer if omitted.
-  --step, --S <value>   Step size (default: 1.0)
-  --function, -f <expr> Function to sum, e.g. "sin(z*z)".
-  --xmin, --xmax        Plot range (default: -4 .. 19)
-  --ymin, --ymax        y axis limits (optional)
-  --no-display          Skip terminal plot (sixels)
-  --force               Skip per term validation when using a fixed --h (use at your own risk).
+cargo run --release -- --function "z+1" --product --xmin -4 --xmax 10
 ```
 
-### Basic example
+This computes the backward indefinite product
 
-```sh
+$$
+G(x) = \prod_{k=1}^{x} (k + 1)
+$$
+
+for step size $S = 1$.
+
+---
+
+## Python package
+
+Install from the repository with maturin:
+
+```
+python -m venv .venv
+source .venv/bin/activate
+pip install maturin
+maturin develop --release
+```
+
+Then:
+
+```
+import norlundcalc
+
+# Indefinite sum: F(x) = sum_{k=1}^{x} k^2
+F = norlundcalc.sum("z^2", a=0.0)
+print(F(4.0))   # (30+0j)
+
+# Indefinite product: G(x) = product_{k=1}^{x} (k+1)
+G = norlundcalc.product("z+1", a=0.0)
+print(G(3.0))   # (24+0j)
+
+# Reusable callable object
+calc = norlundcalc.Calculator("sin(z*z)", a=0.0)
+print(calc(2.5))
+
+# Access the selected zero point
+print(calc.zero_point)
+```
+
+All keyword arguments after `expr` are optional:
+
+```
+sum(expr, *, step=1.0, h=None, a=None, force=False)
+product(expr, *, step=1.0, h=None, a=None, force=False)
+Calculator(expr, *, step=1.0, h=None, a=None, force=False, product=False)
+```
+
+If `h` is omitted, the automatic strip search is used.
+
+In the Python bindings, if `a` is `None` or omitted, the zero point defaults to `0.0`.
+This differs from the CLI, where omitting `--a` triggers automatic zero-point detection.
+
+---
+
+## Rust library
+
+The crate exposes a small high-level API:
+
+```
+use norlundcalc::Calculator;
+
+fn main() -> Result<(), norlundcalc::CalcError> {
+    let sum = Calculator::sum("z^2", 1.0, None, Some(0.0), false)?;
+    let value = sum.eval(4.0)?; // 30 + 0i
+
+    let product = Calculator::product("z+1", 1.0, None, Some(0.0), false)?;
+    let value = product.eval(3.0)?; // 24 + 0i
+
+    Ok(())
+}
+```
+
+## Cargo features
+
+- `default = ["cli"]`: enables PNG/terminal plotting for the CLI binary.
+- `cli`: includes `kuva`, `image`, `icy_sixel`, and `terminal_size`.
+- `python`: enables the PyO3 bindings; used automatically by `maturin`.
+
+To build only the core Rust library without plotting or Python dependencies:
+
+```
+cargo build --lib --no-default-features
+```
+
+To build the Python extension directly with Cargo:
+
+```
+cargo build --lib --features python --no-default-features
+```
+
+---
+
+## CLI
+
+```
+  --h <value>           Strip anchor h
+  --a <value>           Zero point a
+  --step, --S <value>   Step size, default 1.0
+  --function, -f <expr> Function to sum
+  --xmin, --xmax        Plot range
+  --ymin, --ymax        y-axis limits
+  --no-display          Skip sixel terminal preview and plotting
+  --force               Skip per-term validation with fixed --h
+  --product             Compute an indefinite product via exp(sum(ln(f)))
+```
+
+Example:
+
+```
 cargo run --release -- --function "sin(z*z)" --xmin -4 --xmax 19
 ```
 
-Produces `indefinite_sum.png`, `indefinite_sum.csv`, `discrete_sums.csv`, and a sixel terminal preview.  
-The zero point `a` is automatically chosen (usually 0 for sin(z²)), so the curve passes through the origin.
+Produces:
 
-### Exploring different principal solutions via `--h` and `--a`
+- `indefinite_sum.png`
+- `indefinite_sum.csv`
+- `discrete_sums.csv`
+- optional sixel terminal preview
 
-The flag `--h` selects the strip that contains the base interval `[h, h+S]`.  
-The flag `--a` sets the point where the output function is zero (the “empty sum”).  
-If you omit `--a`, the program picks a finite integer where the sum is well defined; the resulting curve may not pass through the origin.
+---
 
-```sh
-# Sum 1/z with the strip anchored at h = -2 (strip containing negative reals),
-# and force the zero point to a = -2 (empty sum at -2).
+## Compilation
+
+```
+git clone https://codeberg.org/AzulBeae/norlundcalc.git
+cd norlundcalc
+cargo build --release
+```
+
+On Unix-like systems, the binary is at `target/release/norlundcalc`.
+
+---
+
+## Usage examples
+
+Sum `1/z` with a chosen strip and zero point:
+
+```
 cargo run --release -- --function "1/z" --xmin -4.44 --xmax 4.44 --h -2 --a -2
 ```
 
-```sh
-# Sum 1/z with default auto h (incidentally chooses the positive reals strip).
-# The zero point is auto detected; for 1/z it will be something like a = 0 or a = 1.
+Sum with automatic strip selection:
+
+```
 cargo run --release -- --function "1/z" --xmin -4.44 --xmax 4.44
 ```
 
-Another nice example is `exp(1/(z-1))` – it has an essential singularity at real part `z=1`.  
-Different strip anchors yield two completely independent principal solutions which lie on *separate* Riemann surfaces:
+Essential singularity, different strips give different principal solutions:
 
-```sh
-# Left of the singularity
+```
 cargo run --release -- --function "E^(1/(z-1))"
-# Auto h finds h = -0.5; auto a typically a = 0.
-
-# Right of the singularity
 cargo run --release -- --function "E^(1/(z-1))" --h 4
-# Strip anchor h = 4; zero point auto selected.
 ```
 
-Both are valid Nørlund principal solutions, each analytic on its own respective maximal strip and *not* analytic on the other’s.
+Step size $S = 2$:
 
-### Changing step size
-
-The `--S` (or `--step`) parameter generalises the operator to step sizes other than 1.  
-For instance, `--S 2` computes the sum over every second integer:
-
-```sh
+```
 cargo run --release -- --function "1/z" --xmin -4.44 --xmax 4.44 --S 2
 ```
 
-The zero point `a` is still auto chosen; use `--a` if you want a specific reference.
+Functions without closed-form antidifferences:
 
-### Functions don’t require a closed form
-
-These methods (Abel–Plana, series expansion) are generic. There are CAS like behaviours in the codebase because you can break `f` down into parts and sum using linearity (so far, only linearity is implemented) to lower the exponential type of each component so it can be digested by these generic methods which cap off at $2\pi/S$. This is **not** a CAS, and never will be one. It is an attempt at creating a generic implementation of the operator that works for all the functions theoretically possible, akin to the Risch algorithm for infinitesimal calculus. Closed forms are not the goal; use SymPy (or other open source options), Mathematica, or Maple if that is what you want.
-
-The Abel–Plana seed strip only needs the function to be analytic and of exponential type $<2\pi/S$ on the **base strip**.  
-It doesn’t care about global behaviour or poles, which is entirely handled via recurrence. This allows antidifferencing the grand majority of things, including that which is not solvable via hypergeometric means (e.g. Karr, Gosper, etc.), as the requirement of being clean on the interval $[h,h+S]$ is satisfied by the grand majority of functions which are holomorphic or meromorphic (we cannot do functions with compact poles, e.g. the Lacunary function, because the poles block us from assessing growth in the imaginary direction, and we are also stopped by pure resonance if it happens).
-
-```sh
+```
 cargo run --release -- --function "sin(E^z)"
 cargo run --release -- --function "E^(E^(E^z))"
 ```
 
-Even `atanh(z)` – whose branch cut excludes the whole real line except $(-1,1)$ – is handled automatically:
+Branch cuts are handled by the automatic `h` search:
 
-```sh
+```
 cargo run --release -- --function "atanh(z)"
-# Auto h finds h = -0.5, leaving the strip safely inside the analytic region.
 ```
 
-For functions with branch cuts or essential singularities, the auto h search automatically discovers a usable strip; you can also steer it manually with `--h` to access different principal branches. The zero point can always be set with `--a`.
+---
+
+## Planned series-expansion fallback
+
+Not yet implemented.
+
+Termwise indefinite summation of a Taylor or Laurent series shifts the **centre** of the convergence disk for the antidifference $F$ by $-S/2$ in the real direction relative to the original expansion point $p$. The singularities and poles of $f$ themselves do **not** shift; only the series centre changes. This offset must be taken into account when choosing expansion points and overlap regions.
+
+Future versions will use adaptive numerical analytic continuation on $f$ over a finite rectangle
+
+$$
+\Re(z) \in [x_{\min}, x_{\max}],
+\qquad
+\Im(z) \in [y_{\min}, y_{\max}].
+$$
+
+This is where AAA rational approximation will be needed: to identify singularity-free disks and select expansion points on a query line of constant real part. Multiple series expansions can then be run from points along that line, with their shifted convergence disks overlapping. Recurrence,
+
+$$
+F(z) - F(z - S) = f(z),
+$$
+
+then connects the local series pieces into a global principal solution.
+
+The series-expansion fallback is intended for functions whose singularities or exponential type prevent direct use of the Abel–Plana method over a full step-length strip.
+
+---
+
+## Existing series-expansion examples
+
+These examples describe the planned approach, see https://math.stackexchange.com/questions/5143622/sources-on-hurwitz-power-series-expansions-for-indefinite-sums-antidifferences for the generic method to be used with hyperdual (to be added). 
+
+### Example: $\mathrm{arctanh}\sqrt{x}$ on $(0,1)$
+
+The power series
+
+$$\mathrm{arctanh}\sqrt{x} = \sum_{n=0}^{\infty} \frac{x^{n+1/2}}{2n+1}$$
+
+is valid for $0 < \Re(x) < 1$.
+
+Applying termwise indefinite summation with the Hurwitz-zeta monomial formula gives
+
+$$F(x) = \sum_{n=0}^{\infty} \frac{1}{2n+1} \left[ \zeta\left(-n-\tfrac12\right) - \zeta\left(-n-\tfrac12, x+1\right) \right].$$
+
+### Example: $\mathrm{arctanh}\sqrt{x}$ on $(1,\infty)$
+
+The Laurent expansion
+
+$$\mathrm{arctanh}\sqrt{x} = -\frac{i\pi}{2} + \sum_{n=0}^{\infty} \frac{x^{-n-1/2}}{2n+1}$$
+
+is valid for $\Re(x) > 1$.
+
+Termwise summation gives
+
+$$F(x) = -\frac{i\pi}{2}(x-1) + \sum_{n=0}^{\infty} \frac{1}{2n+1} \left[ \zeta\left(n+\tfrac12, 2\right) - \zeta\left(n+\tfrac12, x+1\right) \right].$$
+
+These formulas are intentionally left as future reference; the current implementation uses Abel–Plana with recurrence.
+
+---
+
+## Notes
+
+The Abel–Plana seed strip only needs $f$ to be analytic and of exponential type less than $2\pi/S$ on the base strip $[h, h+S]$. Global behaviour and poles are handled by recurrence. This allows the method to work for many functions that are not hypergeometric, but it is **not** a computer algebra system.
+
+Resonance occurs when the exponential type equals an integer multiple of $2\pi/S$; in that case no unique minimal-type principal solution exists.

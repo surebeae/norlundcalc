@@ -1,0 +1,23 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "norlundcalc"
+version = "0.2.0"
+description = "Numerically compute Nørlund principal solutions / indefinite sums and products"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE" }
+authors = [
+  { name = "AzulBeae" },
+]
+classifiers = [
+  "Programming Language :: Rust",
+  "Programming Language :: Python :: 3",
+]
+
+[tool.maturin]
+bindings = "pyo3"
+features = ["python"]
+no-default-features = true

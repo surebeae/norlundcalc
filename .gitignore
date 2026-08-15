@@ -1,0 +1,30 @@
+# Rust
+/target
+Cargo.lock.orig
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.so
+*.pyd
+*.whl
+*.egg-info/
+.mypy_cache/
+.pytest_cache/
+
+# maturin / python build
+dist/
+build/
+*.egg
+
+# Local generated files from norlundcalc CLI
+indefinite_sum.csv
+discrete_sums.csv
+indefinite_sum.png
+
+# Trash
+.vscode/
+.idea/
+.DS_Store
