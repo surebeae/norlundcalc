@@ -97,7 +97,10 @@ fn strip_has_pole_near_axis<F: Fn(Complex<f64>) -> Complex<f64> + Sync>(
     s: f64,
     verbose: bool,
 ) -> bool {
-    let n_x = 10;
+    // 40 points instead of 10 so a pole at a "nice" x-value inside the strip
+    // (e.g. z = i for 1/(z^2+1) with h = -1.4, s = 4, where x = 0) is sampled
+    // rather than falling between grid points.
+    let n_x = 40;
     let y_range = 6.0;
     let y_step = 0.02;
 
@@ -142,7 +145,9 @@ fn strip_is_safe<F: Fn(Complex<f64>) -> Complex<f64> + Sync>(
 
     let m = config.contour_half_height;
     let n_real = 100;
-    let n_imag = 50;
+    // 120 points instead of 50 so y = 1.0 is sampled (needed to catch the pole
+    // of 1/(z^2+1) at z = i for h = -1.4, s = 4).
+    let n_imag = 120;
 
     for i in 0..=n_real {
         let x = h + s * (i as f64 / n_real as f64);
@@ -303,6 +308,61 @@ fn validate_self_consistency<F: Fn(Complex<f64>) -> Complex<f64> + Sync + Clone>
     true
 }
 
+fn check_continuity<F: Fn(Complex<f64>) -> Complex<f64> + Sync>(
+    f: &F,
+    sum_op: &AbelPlanaSum<impl Fn(Complex<f64>) -> Complex<f64> + Sync>,
+    base: f64,
+    epsilon: f64,
+    h: f64,
+    s: f64,
+    skip_on_f_singular: bool,
+) -> bool {
+    if skip_on_f_singular {
+        let t = (base - h) / s;
+        let probe_singular = |x: f64| -> bool {
+            let v = f(Complex::new(x, 0.0));
+            !v.re.is_finite() || !v.im.is_finite() || v.norm() >= 1e6
+        };
+
+        if t >= 0.0 {
+            let n = t.floor() as usize;
+            for k in 0..=n {
+                let x = base - k as f64 * s;
+                if probe_singular(x) {
+                    return true;
+                }
+            }
+        } else {
+            let n = (-t).floor() as usize;
+            for k in 1..=n {
+                let x = base + k as f64 * s;
+                if probe_singular(x) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    let f_plus = sum_op.eval_raw((base + epsilon - h) / s);
+    let f_minus = sum_op.eval_raw((base - epsilon - h) / s);
+
+    if !f_plus.re.is_finite()
+        || !f_plus.im.is_finite()
+        || !f_minus.re.is_finite()
+        || !f_minus.im.is_finite()
+    {
+        return false;
+    }
+
+    if f_plus.norm() >= 1e6 || f_minus.norm() >= 1e6 {
+        return true;
+    }
+
+    let diff = (f_plus - f_minus).norm();
+    let scale = f_plus.norm().max(f_minus.norm()).max(1.0);
+    diff / scale.max(1e-12) <= 5e-3
+}
+
 fn validate_jump_discontinuities<F: Fn(Complex<f64>) -> Complex<f64> + Sync>(
     f: &F,
     h: f64,
@@ -311,6 +371,7 @@ fn validate_jump_discontinuities<F: Fn(Complex<f64>) -> Complex<f64> + Sync>(
 ) -> bool {
     let epsilon = 1e-4;
 
+    // Chosen strip boundaries: x = h + m*s
     for m in 1..=4 {
         let mut sum_has_pole = false;
 
@@ -327,34 +388,25 @@ fn validate_jump_discontinuities<F: Fn(Complex<f64>) -> Complex<f64> + Sync>(
         }
 
         let base = h + m as f64 * s;
-        let f_base_p = f(Complex::new(base + epsilon, 0.0));
-        let f_base_m = f(Complex::new(base - epsilon, 0.0));
-
-        if !f_base_p.re.is_finite()
-            || !f_base_p.im.is_finite()
-            || !f_base_m.re.is_finite()
-            || !f_base_m.im.is_finite()
-            || f_base_p.norm() >= 1e6
-            || f_base_m.norm() >= 1e6
-        {
-            continue;
-        }
-
-        let f_plus = sum_op.eval_raw((base + epsilon - h) / s);
-        let f_minus = sum_op.eval_raw((base - epsilon - h) / s);
-
-        if !f_plus.re.is_finite() || !f_minus.re.is_finite() {
+        if !check_continuity(f, sum_op, base, epsilon, h, s, true) {
             return false;
         }
+    }
 
-        if f_plus.norm() >= 1e6 || f_minus.norm() >= 1e6 {
-            continue;
-        }
+    // recurrence boundaries: x = k*s and at x = h + m*s
+    // The base spline is sampled on [-1, 0] in t-coordinates, so it spans
+    // x in [h - s, h]. If a pole contaminates the Abel-Plana integral that
+    // builds the spline, the resulting error propagates through the recurrence
+    // to discontinuities at both the chosen strip boundaries (h + m*s) and
+    // the canonical boundaries k*s. Nørlund Ch. 4 S3 requires the principal
+    // solution to be continuous across the entire recurrence, not only at
+    // the strip boundaries.
+    let k_min = (h / s).floor() as i64 - 2;
+    let k_max = ((h + s) / s).ceil() as i64 + 2;
 
-        let diff = (f_plus - f_minus).norm();
-        let scale = f_plus.norm().max(f_minus.norm()).max(1.0);
-
-        if diff / scale.max(1e-12) > 5e-3 {
+    for k in k_min..=k_max {
+        let base = k as f64 * s;
+        if !check_continuity(f, sum_op, base, epsilon, h, s, true) {
             return false;
         }
     }
@@ -484,7 +536,6 @@ where
         println!("  trying random shifts in [-30, 30] …");
     }
 
-    // Linear congruential generator for h shifts
     let mut seed = 12345u64;
 
     for _ in 0..50 {

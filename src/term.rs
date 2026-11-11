@@ -4,9 +4,25 @@ use crate::form;
 use crate::mono::{digamma, Branch, MonomialSum, EULER_MASCHERONI};
 use crate::validation::{auto_find_h_verbose, validate_candidate, Config};
 use num_complex::Complex;
-use std::sync::Arc;
+use std::cell::RefCell;
 
 type EvalFn = Box<dyn Fn(f64) -> Complex<f64> + Send + Sync>;
+
+thread_local! {
+    static SCRATCH: RefCell<Option<formulac::Scratch<f64>>> = const { RefCell::new(None) };
+}
+
+fn formulac_eval(
+    compiled: formulac::CompiledFormula<f64, 1>,
+) -> impl Fn(Complex<f64>) -> Complex<f64> + Send + Sync + Clone {
+    move |z| {
+        SCRATCH.with(|cell| {
+            let mut slot = cell.borrow_mut();
+            let scratch = slot.get_or_insert_with(|| compiled.new_scratch());
+            compiled.eval_with_scratch(&[z], scratch)
+        })
+    }
+}
 
 /// Split an expression into signed terms
 pub(crate) fn split_into_terms(expr: &str) -> Vec<(f64, String)> {
@@ -151,14 +167,11 @@ pub(crate) fn build_term(
     config: &Config,
     force: bool,
 ) -> Result<EvalFn, CalcError> {
-    // Closed form for simple cases
     if let Some(cf) = form::try_closed_form(term_str, s, h) {
         return Ok(cf);
     }
 
-    // Monomial fast path using the dedicated integral representation
     if let Some((coeff, p)) = parse_monomial(term_str) {
-        // Special case p = -1: use the digamma closed form
         if (p + 1.0).abs() < 1e-12 {
             let branch_right = h > -s / 2.0;
 
@@ -166,7 +179,7 @@ pub(crate) fn build_term(
                 let val = if branch_right {
                     digamma(x / s + 1.0) + EULER_MASCHERONI
                 } else {
-                    -digamma(-x / s) - EULER_MASCHERONI
+                    digamma(-x / s) + EULER_MASCHERONI
                 };
 
                 Complex::new(coeff * val / s, 0.0)
@@ -187,20 +200,14 @@ pub(crate) fn build_term(
         return Ok(Box::new(closure));
     }
 
-    // Generic Abel–Plana
     let analytic_expr = term_str.replace("log(", "ln(");
-    let compiled = Arc::new(
-        formulac::Builder::<f64, 1>::new(&analytic_expr, ["z"])
-            .compile()
-            .map_err(|e| {
-                CalcError::BuildFailed(format!("could not compile term `{term_str}`: {e:?}"))
-            })?,
-    );
+    let compiled = formulac::Builder::<f64, 1>::new(&analytic_expr, ["z"])
+        .compile()
+        .map_err(|e| {
+            CalcError::BuildFailed(format!("could not compile term `{term_str}`: {e:?}"))
+        })?;
 
-    let f = {
-        let c = Arc::clone(&compiled);
-        move |z: Complex<f64>| c([z])
-    };
+    let f = formulac_eval(compiled);
 
     if !force && !validate_candidate(&f, h, s, config, false) {
         return Err(CalcError::BuildFailed(format!(
@@ -257,20 +264,14 @@ pub(crate) fn build_sum(
         formulac::Builder::<f64, 1>::new(&generic_expr, ["z"])
             .compile()
             .ok()
-            .map(Arc::new)
     };
 
-    // Determine the global strip anchor.
     let global_h = if let Some(h_user) = h_opt {
         h_user
     } else {
         match compiled_full {
             Some(c) => {
-                let f_whole = {
-                    let c = Arc::clone(&c);
-                    move |z: Complex<f64>| c([z])
-                };
-
+                let f_whole = formulac_eval(c);
                 auto_find_h_verbose(&f_whole, s, config, false).ok_or_else(|| {
                     CalcError::BuildFailed("automatic h search failed".to_string())
                 })?

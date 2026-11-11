@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::f64::consts::PI;
 use std::sync::Mutex;
 
-pub(crate) const EULER_MASCHERONI: f64 = 0.57721566490153286060651209008240243104215933593992;
+pub(crate) use std::f64::consts::EULER_GAMMA as EULER_MASCHERONI;
 
 // Digamma function
 // Valid for real x, excluding poles at negative integers

@@ -140,7 +140,7 @@ mod tests {
     #[test]
     fn backward_product_z_plus_one_is_correct() {
         let calc = Calculator::product("z+1", 1.0, Some(0.5), Some(0.0), false)
-            .expect("product should build");
+            .expect("product should build without force");
 
         let value = calc.eval(3.0).expect("evaluation should succeed");
 
