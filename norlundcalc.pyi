@@ -11,6 +11,7 @@ class Calculator:
         a: Optional[float] = None,
         force: bool = False,
         product: bool = False,
+        mean: bool = False,
     ) -> None: ...
     def __call__(self, x: float) -> complex:
         """Raises ValueError for non-finite x or a non-finite result, and
@@ -20,7 +21,9 @@ class Calculator:
         """Parallel evaluation without the GIL; nan+nanj where __call__ would raise."""
         ...
     @property
-    def zero_point(self) -> float: ...
+    def zero_point(self) -> float:
+        """nan for a mean inverse."""
+        ...
     @property
     def seed(self) -> float:
         """Left edge h of the seed strip [h, h + step] that was used."""
@@ -49,3 +52,14 @@ def product(
     a: Optional[float] = None,
     force: bool = False,
 ) -> Calculator: ...
+
+
+def mean(
+    expr: str,
+    *,
+    step: float = 1.0,
+    h: Optional[float] = None,
+    force: bool = False,
+) -> Calculator:
+    """Mean inverse (Wechselsumme): (G(x) + G(x - step))/2 = f(x)."""
+    ...

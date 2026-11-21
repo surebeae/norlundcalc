@@ -14,7 +14,7 @@ The project provides:
 - a Rust library,
 - a Python package with bindings.
 
-Indefinite products are implemented, with closed forms for known factors. Series-expansion fallback is planned but not yet implemented.
+Indefinite products and the mean inverse (Nørlund's Wechselsumme) are implemented, with closed forms for known terms. Series-expansion fallback is planned but not yet implemented.
 
 ## Notation
 
@@ -86,6 +86,60 @@ for step size $S = 1$, in closed form.
 
 ---
 
+## Mean inverse (Wechselsumme)
+
+With `--mean`, the program computes the solution of
+
+$$
+\tfrac12\big(G(z) + G(z - S)\big) = f(z),
+$$
+
+the inverse of the mean operator $\mathfrak M_S$. The symbol $\tfrac12(1+e^{-cS})$ has no zero at $c=0$, so constants are not in the kernel: **there is no zero point**, and `--a` is rejected. The kernel is the antiperiodic functions, $G(z-S) = -G(z)$, the first being $e^{i\pi z/S}$, so the solution is unique for $f$ of exponential type below $\pi/S$ (half the bound for sums).
+
+Closed forms, with $t = x/S$:
+
+| term | mean inverse |
+|---|---|
+| constant $c$ | $c$ |
+| $x^p$, integer $0 \le p \le 20$ | $S^p E_p(t+1)$ (Euler polynomials) |
+| $x^p$, other $p$ | right $2S^p\,\eta(-p, t+1)$, left $2S^p e^{i\pi p}\,\eta(-p, -t)$ |
+| $e^{cx}$ | $2e^{cx}/(1+e^{-cS})$, resonant at $cS = i\pi(2k+1)$ |
+| $\sin$, $\cos$ | through Euler's formula |
+
+Here $\eta(s,a) = \sum_{k\ge0} (-1)^k (k+a)^{-s}$; $p=-1$ gives $\tfrac2S\beta(t+1)$. Affine arguments $(az+b)^p$ shift as for sums.
+
+Other terms go through Abel–Plana with the alternating kernel,
+
+$$
+G(x) = f(x) - i\int_0^\infty \frac{f(x+iSt) - f(x-iSt)}{\sinh \pi t}\,dt,
+$$
+
+on the seed strip $[h, h+S]$, then the recurrence $G(x) = 2f(x) - G(x - S)$. There is no $\int^x f$ term. Strips on different sides of a singularity give solutions that differ by an antiperiodic function, as with sums.
+
+### Engines
+
+`--engine` (or `Config::engine`) selects how terms are evaluated:
+
+- `auto` (default): closed forms where known, Abel–Plana for the rest.
+- `plana`: the whole expression through Abel–Plana. Also works for sums and products.
+- `gray` (`--mean` only): the right branch $2\sum_{k\ge1} (-1)^{k-1} f(x+kS)$, summed by Euler's method $(E,1)$. Gray (1966) shows that a regular method summing $\sum z^k$ to $1/(1-z)$ sums the Neumann series of $(\lambda I - T)u = f$ when $\lambda$ is outside the spectrum of $T$; here $\lambda = -1$ and $T$ is the shift. The error falls like $\sin(\tau S/2)^n$ for exponential type $\tau$. It uses only $f$ on the lattice $x + kS$: no strip, no quadrature.
+
+The three are independent and are tested against each other (`mean_engines_agree`, and `mean_plana_matches_gray` with closures in `src/abel.rs`). `gray` always gives the right branch, so compare it with an `h` right of every singularity.
+
+Past the uniqueness bound, `gray` and the closed forms agree on isolated frequencies (both give the continuation in the frequency), while Abel–Plana refuses:
+
+```
+cargo run --release -- --mean --function "sin(4*z)" --engine gray
+```
+
+Example:
+
+```
+cargo run --release -- --mean --function "1/(z^2+1)" --h 0.5
+```
+
+---
+
 ## Python package
 
 Install from the repository with maturin:
@@ -110,6 +164,10 @@ print(F(4.0))   # (30+0j)
 G = norlundcalc.product("z+1", a=0.0)
 print(G(3.0))   # (24+0j)
 
+# Mean inverse: (G(x) + G(x - 1))/2 = x^2, G(x) = E_2(x + 1)
+M = norlundcalc.mean("z^2")
+print(M(2.0))   # (6+0j)
+
 # Reusable callable object
 calc = norlundcalc.Calculator("sin(z*z)", a=0.0)
 print(calc(2.5))
@@ -128,12 +186,13 @@ All keyword arguments after `expr` are optional:
 ```
 sum(expr, *, step=1.0, h=None, a=None, force=False)
 product(expr, *, step=1.0, h=None, a=None, force=False)
-Calculator(expr, *, step=1.0, h=None, a=None, force=False, product=False)
+mean(expr, *, step=1.0, h=None, force=False)
+Calculator(expr, *, step=1.0, h=None, a=None, force=False, product=False, mean=False)
 ```
 
 If `h` is omitted, the automatic strip search is used.
 
-In the Python bindings, if `a` is `None` or omitted, the zero point defaults to `0.0`.
+In the Python bindings, if `a` is `None` or omitted, the zero point defaults to `0.0`. A mean inverse has no zero point; its `zero_point` is `nan`.
 In the CLI, `--product` defaults `--a` to `0.0`, while sums pick the first finite point near `[xmin - 10, xmax + 10]` when `--a` is omitted.
 
 ---
@@ -143,7 +202,7 @@ In the CLI, `--product` defaults `--a` to `0.0`, while sums pick the first finit
 The crate exposes a small high-level API:
 
 ```
-use norlundcalc::Calculator;
+use norlundcalc::{Calculator, Config, Engine};
 
 fn main() -> Result<(), norlundcalc::CalcError> {
     let sum = Calculator::sum("z^2", 1.0, None, Some(0.0), false)?;
@@ -155,11 +214,18 @@ fn main() -> Result<(), norlundcalc::CalcError> {
     let values = sum.eval_many(&[0.5, 1.5, 2.5]); // parallel, NaN where eval fails
     let (lo, hi) = sum.domain(); // x range eval accepts
 
+    let mean = Calculator::mean("z^2", 1.0, None, false)?;
+    let value = mean.eval(2.0)?; // 6 + 0i
+
+    let mut config = Config::default();
+    config.engine = Engine::Gray;
+    let gray = Calculator::mean_with_config("z^2", 1.0, None, false, &config)?;
+
     Ok(())
 }
 ```
 
-`Calculator::sum_with_config` and `product_with_config` take a `Config` (start from `Config::default()`).
+`Calculator::sum_with_config`, `product_with_config` and `mean_with_config` take a `Config` (start from `Config::default()`).
 
 ## Cargo features
 
@@ -196,6 +262,8 @@ cargo build --lib --features python --no-default-features
   --no-display          Disable PNG rendering and sixel terminal preview
   --force               Skip strip validation (with --h; the search still validates)
   --product             Compute an indefinite product via exp(sum(ln(f)))
+  --mean                Mean inverse (Wechselsumme), (G(x) + G(x-S))/2 = f(x); no --a
+  --engine <e>          auto (default), plana (all Abel-Plana), gray (--mean only)
   -h, --help            Usage
 ```
 
@@ -332,6 +400,6 @@ These formulas are intentionally left as future reference; the current implement
 
 Constants, $(az+b)^p$ (Hurwitz $\zeta$, digamma at $p=-1$, Bernoulli polynomials for integer $0 \le p \le 20$), and $e^{az+b}$, $c^{az+b}$, $\sin(az+b)$, $\cos(az+b)$ (Nørlund's $e^{\beta x}$ example) are summed in closed form; only the remaining terms go through Abel–Plana, combined into one build.
 
-The Abel–Plana seed strip only needs $f$ to be analytic and of exponential type less than $2\pi/S$ on the base strip $[h, h+S]$. Global behaviour and poles are handled by recurrence. This allows the method to work for many functions that are not hypergeometric, but it is **not** a computer algebra system.
+The Abel–Plana seed strip only needs $f$ to be analytic and of exponential type less than $2\pi/S$ ($\pi/S$ for the mean) on the base strip $[h, h+S]$. Global behaviour and poles are handled by recurrence. This allows the method to work for many functions that are not hypergeometric, but it is **not** a computer algebra system.
 
-Resonance occurs when the exponential type equals an integer multiple of $2\pi/S$; in that case no unique minimal-type principal solution exists.
+Resonance occurs when the exponential type equals an integer multiple of $2\pi/S$ (an odd multiple of $\pi/S$ for the mean); in that case no unique minimal-type principal solution exists.
