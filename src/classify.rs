@@ -1,7 +1,7 @@
 use crate::error::CalcError;
 use crate::expsum::{self, EvalFn, ExpPart};
 use crate::limits::{self, MAX_TERMS, PARSE_STACK_BYTES};
-use crate::util::is_finite;
+use crate::util::{is_finite, Op};
 use formulac::expr::{ExprKind, ExprRef};
 use formulac::functions::FunctionKind;
 use formulac::operators::{BinaryOperatorKind, UnaryOperatorKind};
@@ -31,18 +31,19 @@ pub(crate) enum Term {
 
 const ONE: Complex<f64> = Complex::new(1.0, 0.0);
 
-// Terms of expr; s is needed to detect resonant exponentials.
-pub(crate) fn classify(expr: &str, s: f64) -> Result<Vec<Term>, CalcError> {
+// Terms of expr for op; s is needed to detect resonant exponentials.
+// closed = false gives the whole expression as one generic term.
+pub(crate) fn classify(expr: &str, s: f64, op: Op, closed: bool) -> Result<Vec<Term>, CalcError> {
     limits::check_expr(expr)?;
     let normalized = limits::normalize(expr);
-    on_parser_thread(move || classify_inner(&normalized, s))
+    on_parser_thread(move || classify_inner(&normalized, s, op, closed))
 }
 
-// Terms of ln(expr), one or more per top level factor of expr.
-pub(crate) fn classify_product(expr: &str, s: f64) -> Result<Vec<Term>, CalcError> {
+// Terms of ln(expr), one or more per top level factor of expr (one in all if !closed).
+pub(crate) fn classify_product(expr: &str, s: f64, closed: bool) -> Result<Vec<Term>, CalcError> {
     limits::check_expr(expr)?;
     let normalized = limits::normalize(expr);
-    on_parser_thread(move || classify_product_inner(&normalized, s))
+    on_parser_thread(move || classify_product_inner(&normalized, s, closed))
 }
 
 // Parse on a large-stack thread; a panic in formulac becomes an error.
@@ -59,11 +60,14 @@ fn on_parser_thread<T: Send>(f: impl FnOnce() -> Result<T, CalcError> + Send) ->
     })
 }
 
-fn classify_inner(formula: &str, s: f64) -> Result<Vec<Term>, CalcError> {
+fn classify_inner(formula: &str, s: f64, op: Op, closed: bool) -> Result<Vec<Term>, CalcError> {
     let expr = Builder::<f64, 1>::new(formula, ["z"])
         .parse()
         .map_err(|e| CalcError::InvalidInput(format!("could not parse `{formula}`: {e:?}")))?
         .simplify();
+    if !closed {
+        return Ok(vec![Term::Generic { coeff: ONE, formula: expr.compile(), text: expr.to_string() }]);
+    }
 
     let mut terms = Vec::new();
     collect_terms(expr.view(), &mut terms);
@@ -73,14 +77,17 @@ fn classify_inner(formula: &str, s: f64) -> Result<Vec<Term>, CalcError> {
             terms.len()
         )));
     }
-    terms.into_iter().map(|(e, sign)| classify_term(e, Complex::new(sign, 0.0), s)).collect()
+    terms.into_iter().map(|(e, sign)| classify_term(e, Complex::new(sign, 0.0), s, op)).collect()
 }
 
-fn classify_product_inner(formula: &str, s: f64) -> Result<Vec<Term>, CalcError> {
+fn classify_product_inner(formula: &str, s: f64, closed: bool) -> Result<Vec<Term>, CalcError> {
     let expr = Builder::<f64, 1>::new(formula, ["z"])
         .parse()
         .map_err(|e| CalcError::InvalidInput(format!("could not parse `{formula}`: {e:?}")))?
         .simplify();
+    if !closed {
+        return Ok(vec![Term::LogGeneric { formula: expr.compile(), text: expr.to_string() }]);
+    }
 
     let mut c = ONE;
     let mut factors = Vec::new();
@@ -146,7 +153,7 @@ fn log_exponent(g: E<'_>, scale: Complex<f64>, s: f64, out: &mut Vec<Term>) -> R
     let mut terms = Vec::new();
     collect_terms(g, &mut terms);
     for (e, sign) in terms {
-        out.push(classify_term(e, scale * sign, s)?);
+        out.push(classify_term(e, scale * sign, s, Op::Sum)?);
     }
     Ok(())
 }
@@ -235,7 +242,7 @@ fn is_real(z: Complex<f64>) -> bool {
     z.im == 0.0
 }
 
-fn classify_term(term: E<'_>, scale: Complex<f64>, s: f64) -> Result<Term, CalcError> {
+fn classify_term(term: E<'_>, scale: Complex<f64>, s: f64, op: Op) -> Result<Term, CalcError> {
     let mut c = scale;
     let mut factors = Vec::new();
     split_factors(term, &mut c, &mut factors);
@@ -244,7 +251,14 @@ fn classify_term(term: E<'_>, scale: Complex<f64>, s: f64) -> Result<Term, CalcE
         return generic(term, scale);
     }
     let body = match factors.as_slice() {
-        [] => return Ok(Term::Closed(Box::new(move |x: f64| c * (x / s)))),
+        // Σ c = c x/S; the mean inverse of c is c
+        [] => {
+            let f: EvalFn = match op {
+                Op::Sum => Box::new(move |x: f64| c * (x / s)),
+                Op::Mean => Box::new(move |_: f64| c),
+            };
+            return Ok(Term::Closed(f));
+        }
         [body] => *body,
         _ => return generic(term, scale),
     };
@@ -272,7 +286,7 @@ fn classify_term(term: E<'_>, scale: Complex<f64>, s: f64) -> Result<Term, CalcE
                         let l = base.ln();
                         let real = is_real(c) && is_real(a) && is_real(b);
                         let parts = [ExpPart { coeff: c, c: a * l, d: b * l }];
-                        if let Some(f) = expsum::build(&parts, s, real) {
+                        if let Some(f) = expsum::build(&parts, s, real, op) {
                             return Ok(Term::Closed(f));
                         }
                     }
@@ -298,7 +312,7 @@ fn classify_term(term: E<'_>, scale: Complex<f64>, s: f64) -> Result<Term, CalcE
                         ExpPart { coeff: c / 2.0, c: -I * a, d: -I * b },
                     ],
                 };
-                if let Some(f) = expsum::build(&parts, s, real) {
+                if let Some(f) = expsum::build(&parts, s, real, op) {
                     return Ok(Term::Closed(f));
                 }
             }

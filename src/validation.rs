@@ -1,13 +1,27 @@
 use crate::abel::{AbelPlanaSum, Mode};
-use crate::util::is_finite;
+use crate::util::{is_finite, Op};
 use num_complex::Complex;
 use rayon::prelude::*;
 use std::f64::consts::PI;
+
+// How terms are evaluated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum Engine {
+    // Closed forms where known, Abel-Plana for the rest.
+    #[default]
+    Auto,
+    // The whole expression through Abel-Plana.
+    Plana,
+    // Mean only: the alternating series 2 Σ (-1)^{k-1} f(x + kS) by Euler summation (Gray 1966).
+    Gray,
+}
 
 // Numerical parameters; start from Config::default().
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct Config {
+    pub engine: Engine,
     // Gauss-Legendre order per panel.
     pub gl_order: usize,
     // Upper limit of the Abel-Plana tail integral, in units of the step.
@@ -26,11 +40,15 @@ pub struct Config {
     pub decay_tolerance: f64,
     // Max recurrence steps per evaluation; bounds the work for large |x|.
     pub max_recurrence: u64,
+    // Engine::Gray: most terms of the series, and the agreement required of t_n and t_2n.
+    pub gray_max_terms: usize,
+    pub gray_tol: f64,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
+            engine: Engine::Auto,
             gl_order: 16,
             tail_y_cap: 60.0,
             tail_rel_tol: 1e-17,
@@ -42,6 +60,8 @@ impl Default for Config {
             decay_n_points: 8,
             decay_tolerance: 1e-2,
             max_recurrence: 1 << 24,
+            gray_max_terms: 1 << 16,
+            gray_tol: 1e-13,
         }
     }
 }
@@ -132,7 +152,12 @@ fn strip_is_safe<F: Fn(CF) -> CF + Sync>(f: &F, h: f64, s: f64, config: &Config,
     !rough
 }
 
-fn validate_decay<F: Fn(CF) -> CF + Sync>(f: &F, h: f64, s: f64, config: &Config, verbose: bool) -> bool {
+// Exponential type below 2π/S (sum, measured on f(z+S) - f(z)) or π/S (mean, on f).
+fn validate_decay<F: Fn(CF) -> CF + Sync>(f: &F, op: Op, h: f64, s: f64, config: &Config, verbose: bool) -> bool {
+    let limit = match op {
+        Op::Sum => 2.0 * PI / s,
+        Op::Mean => PI / s,
+    };
     let n_x = 5;
     let y_min = config.contour_half_height.max(5.0);
     let y_max = config.decay_ymax.max(y_min);
@@ -142,14 +167,17 @@ fn validate_decay<F: Fn(CF) -> CF + Sync>(f: &F, h: f64, s: f64, config: &Config
         for k in 0..n {
             let y = y_min * (y_max / y_min).powf(k as f64 / (n as f64 - 1.0));
             let z = Complex::new(x, y);
-            let mag = (f(z + Complex::new(s, 0.0)) - f(z)).norm();
+            let mag = match op {
+                Op::Sum => (f(z + Complex::new(s, 0.0)) - f(z)).norm(),
+                Op::Mean => f(z).norm(),
+            };
             if !mag.is_finite() || mag <= 0.0 {
                 continue;
             }
             let rate = mag.ln() / y;
-            if rate >= 2.0 * PI - config.decay_tolerance {
+            if rate >= limit - config.decay_tolerance {
                 if verbose {
-                    eprintln!("    [fail] exponential type ≥ τ (rate={rate:.6} at x={x:.6})");
+                    eprintln!("    [fail] exponential type ≥ {limit:.6} (rate={rate:.6} at x={x:.6})");
                 }
                 return false;
             }
@@ -165,14 +193,14 @@ fn validate_self_consistency<F: Fn(CF) -> CF + Sync, G: Fn(CF) -> CF + Sync>(
     op: &AbelPlanaSum<G>,
     verbose: bool,
 ) -> bool {
-    // F(x) - F(x - S) = f(x) at x = h + S·{0.2, ..., 0.8}; holds by construction.
+    // The operator applied to the solution gives f at x = h + S·{0.2, ..., 0.8}; holds by construction.
     for i in 0..5 {
         let x = h + s * (0.2 + 0.15 * i as f64);
         let fx = f(Complex::new(x, 0.0));
         if bad(fx) {
             continue;
         }
-        let diff = (op.eval_raw(x) - op.eval_raw(x - s) - fx).norm();
+        let diff = (op.apply(x) - fx).norm();
         if diff > 1e-8 * fx.norm().max(1.0) {
             if verbose {
                 eprintln!("    [fail] self-check of F at x={x:.3}");
@@ -241,11 +269,19 @@ fn validate_discrete_sums<F: Fn(CF) -> CF + Sync, G: Fn(CF) -> CF + Sync>(
     op: &AbelPlanaSum<G>,
     verbose: bool,
 ) -> bool {
-    // F(h + m·S) - F(h) = Σ f(h + k·S); holds by construction, catches evaluation failures.
+    // Sum: F(h + m·S) - F(h) = Σ f(h + k·S).  Mean: G(h + m·S) = 2f(h + m·S) - G(h + (m-1)·S).
+    // Holds by construction, catches evaluation failures.
     let mut any_ok = false;
-    let mut disc = Complex::new(0.0, 0.0);
+    let mut disc = match op.op() {
+        Op::Sum => Complex::new(0.0, 0.0),
+        Op::Mean => op.eval_raw(h),
+    };
     for m in 1..=10 {
-        disc += f(Complex::new(h + s * m as f64, 0.0));
+        let fm = f(Complex::new(h + s * m as f64, 0.0));
+        disc = match op.op() {
+            Op::Sum => disc + fm,
+            Op::Mean => 2.0 * fm - disc,
+        };
         if bad(disc) {
             break;
         }
@@ -271,6 +307,7 @@ fn validate_discrete_sums<F: Fn(CF) -> CF + Sync, G: Fn(CF) -> CF + Sync>(
 // Validate the seed strip [h, h+S] and, on success, return the operator built on it.
 pub(crate) fn validate_candidate<F>(
     g: &F,
+    sum_op: Op,
     mode: Mode,
     h: f64,
     s: f64,
@@ -282,7 +319,7 @@ where
 {
     let f = g;
     // cheapest first
-    if !validate_decay(f, h, s, config, verbose) {
+    if !validate_decay(f, sum_op, h, s, config, verbose) {
         return None;
     }
     if !strip_is_safe(f, h, s, config, verbose) {
@@ -291,7 +328,7 @@ where
         }
         return None;
     }
-    let op = match AbelPlanaSum::with_mode(g.clone(), mode, h, s, config) {
+    let op = match AbelPlanaSum::build(g.clone(), sum_op, mode, h, s, config) {
         Ok(op) => op,
         Err(e) => {
             if verbose {
@@ -319,6 +356,7 @@ where
 // Search for a valid seed strip; returns it with its operator.
 pub(crate) fn auto_find_h<F>(
     f: &F,
+    op: Op,
     mode: Mode,
     s: f64,
     config: &Config,
@@ -340,8 +378,8 @@ where
         if verbose {
             eprintln!("  trying h = {h:>6.2} ...");
         }
-        if let Some(op) = validate_candidate(f, mode, h, s, config, verbose) {
-            return Some((h, op));
+        if let Some(built) = validate_candidate(f, op, mode, h, s, config, verbose) {
+            return Some((h, built));
         }
     }
     None
@@ -354,7 +392,7 @@ mod tests {
     #[test]
     fn finds_strip_for_rational_function() {
         let f = |z: CF| Complex::new(1.0, 0.0) / (z * z + Complex::new(1.0, 0.0));
-        let (h, op) = auto_find_h(&f, Mode::Plain, 1.0, &Config::default(), false).expect("strip");
+        let (h, op) = auto_find_h(&f, Op::Sum, Mode::Plain, 1.0, &Config::default(), false).expect("strip");
         let x = h + 3.3;
         let d = op.eval_raw(x) - op.eval_raw(x - 1.0) - f(Complex::new(x, 0.0));
         assert!(d.norm() < 1e-10);
@@ -364,7 +402,7 @@ mod tests {
     fn rejects_type_two_pi() {
         // e^{τiz/S} sits at the resonance: exponential type exactly τ
         let f = |z: CF| (Complex::new(0.0, 2.0 * PI) * z).exp();
-        assert!(validate_candidate(&f, Mode::Plain, 0.1, 1.0, &Config::default(), false).is_none());
+        assert!(validate_candidate(&f, Op::Sum, Mode::Plain, 0.1, 1.0, &Config::default(), false).is_none());
     }
 
     // Two valid strips agree up to a constant; the principal branch of ln does not.
@@ -372,8 +410,8 @@ mod tests {
     fn log_mode_continues_branch_along_rays() {
         let g = |z: CF| (z * z).sin().ln();
         let cfg = Config::default();
-        let a = validate_candidate(&g, Mode::Log, 0.1, 1.0, &cfg, false).expect("strip at 0.1");
-        let b = validate_candidate(&g, Mode::Log, 0.3, 1.0, &cfg, false).expect("strip at 0.3");
+        let a = validate_candidate(&g, Op::Sum, Mode::Log, 0.1, 1.0, &cfg, false).expect("strip at 0.1");
+        let b = validate_candidate(&g, Op::Sum, Mode::Log, 0.3, 1.0, &cfg, false).expect("strip at 0.3");
         let d0 = a.eval_raw(0.7) - b.eval_raw(0.7);
         for &x in &[0.45, 1.05, 1.6, 2.9, -0.6] {
             let d = a.eval_raw(x) - b.eval_raw(x) - d0;
@@ -388,8 +426,28 @@ mod tests {
     }
 
     #[test]
+    fn finds_strip_for_mean() {
+        let f = |z: CF| Complex::new(1.0, 0.0) / (z * z + Complex::new(1.0, 0.0));
+        let (h, op) = auto_find_h(&f, Op::Mean, Mode::Plain, 1.0, &Config::default(), false).expect("strip");
+        let x = h + 3.3;
+        let d = 0.5 * (op.eval_raw(x) + op.eval_raw(x - 1.0)) - f(Complex::new(x, 0.0));
+        assert!(d.norm() < 1e-10);
+    }
+
+    #[test]
+    fn mean_type_limit_is_pi_over_s() {
+        // sin(3.5z): type 3.5 is above π/S for S = 1 and below it for S = 1/2
+        let f = |z: CF| (Complex::new(3.5, 0.0) * z).sin();
+        let cfg = Config::default();
+        assert!(validate_candidate(&f, Op::Mean, Mode::Plain, 0.1, 1.0, &cfg, false).is_none());
+        assert!(validate_candidate(&f, Op::Mean, Mode::Plain, 0.1, 0.5, &cfg, false).is_some());
+        // the sum allows twice the type
+        assert!(validate_candidate(&f, Op::Sum, Mode::Plain, 0.1, 1.0, &cfg, false).is_some());
+    }
+
+    #[test]
     fn rejects_strip_with_pole() {
         let f = |z: CF| Complex::new(1.0, 0.0) / (z - Complex::new(0.5, 0.0));
-        assert!(validate_candidate(&f, Mode::Plain, 0.1, 1.0, &Config::default(), false).is_none());
+        assert!(validate_candidate(&f, Op::Sum, Mode::Plain, 0.1, 1.0, &Config::default(), false).is_none());
     }
 }

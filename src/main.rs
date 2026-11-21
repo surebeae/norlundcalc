@@ -1,4 +1,4 @@
-use norlundcalc::{build_sum_raw, Calculator};
+use norlundcalc::{build_sum_raw_with_config, Calculator, Config, Engine};
 use num_complex::Complex;
 use rayon::prelude::*;
 use std::env;
@@ -32,6 +32,9 @@ usage: norlundcalc-cli [options]
       --out-dir DIR     where CSV/PNG files go (default: .)
       --png-scale K     PNG file size, K x 2400x1600 px (default: 2, max 3; 0 = no PNG file)
       --product         indefinite product instead of sum
+      --mean            mean inverse (Wechselsumme), (G(x) + G(x-S))/2 = f(x); no --a
+      --engine E        auto (closed forms + Abel-Plana), plana (all Abel-Plana),
+                        gray (--mean only: Euler-summed alternating series) (default: auto)
       --force           skip strip validation
       --no-display      do not render the plot
   -h, --help";
@@ -54,6 +57,8 @@ struct CliArgs {
     no_display: bool,
     force: bool,
     product: bool,
+    mean: bool,
+    engine: Engine,
 }
 
 fn parse_args() -> Result<Option<CliArgs>, String> {
@@ -73,6 +78,8 @@ fn parse_args() -> Result<Option<CliArgs>, String> {
         no_display: false,
         force: false,
         product: false,
+        mean: false,
+        engine: Engine::Auto,
     };
     let mut it = args.iter();
 
@@ -107,6 +114,15 @@ fn parse_args() -> Result<Option<CliArgs>, String> {
             "--no-display" => out.no_display = true,
             "--force" => out.force = true,
             "--product" => out.product = true,
+            "--mean" => out.mean = true,
+            "--engine" => {
+                out.engine = match value(&mut it, arg)? {
+                    "auto" => Engine::Auto,
+                    "plana" => Engine::Plana,
+                    "gray" => Engine::Gray,
+                    other => return Err(format!("--engine: `{other}` is not auto, plana or gray")),
+                }
+            }
             "-h" | "--help" => return Ok(None),
             other => return Err(format!("unknown argument: {other}")),
         }
@@ -127,6 +143,15 @@ fn parse_args() -> Result<Option<CliArgs>, String> {
     if out.points < 2 || out.points > MAX_POINTS {
         return Err(format!("--points must be between 2 and {MAX_POINTS}"));
     }
+    if out.mean && out.product {
+        return Err("--mean and --product cannot be combined".to_string());
+    }
+    if out.mean && out.a.is_some() {
+        return Err("--mean has no zero point; drop --a".to_string());
+    }
+    if out.engine == Engine::Gray && !out.mean {
+        return Err("--engine gray needs --mean".to_string());
+    }
     Ok(Some(out))
 }
 
@@ -141,18 +166,28 @@ fn auto_find_a(eval: &(impl Fn(f64) -> Complex<f64> + Sync), xmin: f64, xmax: f6
         })
 }
 
+// The evaluator and the lattice origin for the dots (the zero point for sums and products).
 fn build(args: &CliArgs) -> Result<(f64, Eval), String> {
     let s = args.step;
+    let mut config = Config::default();
+    config.engine = args.engine;
+    let wrap = |calc: Calculator| -> Eval { Box::new(move |x| calc.eval(x).unwrap_or(Complex::new(f64::NAN, f64::NAN))) };
+    if args.mean {
+        let calc = Calculator::mean_with_config(&args.function, s, args.h, args.force, &config).map_err(|e| e.to_string())?;
+        return Ok((0.0, wrap(calc)));
+    }
     if args.product {
         let a = args.a.unwrap_or(0.0);
-        let calc = Calculator::product(&args.function, s, args.h, Some(a), args.force).map_err(|e| e.to_string())?;
-        return Ok((a, Box::new(move |x| calc.eval(x).unwrap_or(Complex::new(f64::NAN, f64::NAN)))));
+        let calc = Calculator::product_with_config(&args.function, s, args.h, Some(a), args.force, &config)
+            .map_err(|e| e.to_string())?;
+        return Ok((a, wrap(calc)));
     }
     if let Some(a) = args.a {
-        let calc = Calculator::sum(&args.function, s, args.h, Some(a), args.force).map_err(|e| e.to_string())?;
-        return Ok((a, Box::new(move |x| calc.eval(x).unwrap_or(Complex::new(f64::NAN, f64::NAN)))));
+        let calc =
+            Calculator::sum_with_config(&args.function, s, args.h, Some(a), args.force, &config).map_err(|e| e.to_string())?;
+        return Ok((a, wrap(calc)));
     }
-    let raw = build_sum_raw(&args.function, s, args.h, None, args.force).map_err(|e| e.to_string())?;
+    let raw = build_sum_raw_with_config(&args.function, s, args.h, None, args.force, &config).map_err(|e| e.to_string())?;
     let a = auto_find_a(&raw, args.xmin, args.xmax).ok_or("no finite zero point found near the plot range; pass --a")?;
     println!("Using zero point a = {a}");
     let offset = raw(a);
@@ -173,6 +208,7 @@ struct PlotData<'a> {
     disc_real: &'a [Point],
     disc_imag: &'a [Point],
     product: bool,
+    mean: bool,
     a: f64,
     x: (f64, f64),
     y: (f64, f64),
@@ -184,7 +220,9 @@ impl PlotData<'_> {
     fn render(&self, scale: f32) -> Result<plot::Image, String> {
         use plot::{Figure, Rgb, Series, Style, Theme};
         let a = self.a;
-        let title = if self.product {
+        let title = if self.mean {
+            "mean inverse, (G(x) + G(x-S))/2 = f(x) — lines (continuous) & dots (x = S·k)".to_string()
+        } else if self.product {
             format!("Π u(S·k+a) — lines (continuous) & dots (integer products), a={a}")
         } else {
             format!("Σ f(S·k+a) — lines (continuous) & dots (integer sums), a={a}")
@@ -193,7 +231,13 @@ impl PlotData<'_> {
         let fig = Figure {
             title: &title,
             x_label: "x",
-            y_label: if self.product { "Π u(S·k+a)" } else { "Σ f(S·k+a)" },
+            y_label: if self.mean {
+                "G(x)"
+            } else if self.product {
+                "Π u(S·k+a)"
+            } else {
+                "Σ f(S·k+a)"
+            },
             x_range: self.x,
             y_range: self.y,
             series: vec![
@@ -307,6 +351,7 @@ fn run(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
             disc_real: &disc_real,
             disc_imag: &disc_imag,
             product: args.product,
+            mean: args.mean,
             a: zero_point_a,
             x: (args.xmin, args.xmax),
             y: (args.ymin, args.ymax),

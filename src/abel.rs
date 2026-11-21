@@ -1,6 +1,6 @@
 use crate::cheb::{lobatto_point, Chebyshev};
 use crate::quadrature::{gauss_legendre, GaussRule};
-use crate::util::{is_finite, KahanSum, NAN};
+use crate::util::{is_finite, KahanSum, Op, NAN};
 use crate::validation::Config;
 use num_complex::Complex;
 use rayon::prelude::*;
@@ -22,22 +22,30 @@ fn unwrap_log(prev: Complex<f64>, new: Complex<f64>) -> Complex<f64> {
     Complex::new(new.re, new.im + 2.0 * PI * k)
 }
 
-// -1/2 u(w) - i·Tail(w), and whether the tail converged.
+// Sum: -1/2 u(w) - i·Tail(w), the base without ∫_0^w u.  Mean: u(w) - i·Tail(w) = G.
+// Also whether the tail converged.
 fn base_without_integral<G: Fn(Complex<f64>) -> Complex<f64>>(
     u: &G,
+    op: Op,
     mode: Mode,
     w: f64,
     rule: &GaussRule,
     config: &Config,
 ) -> (Complex<f64>, bool) {
     let uw = u(Complex::new(w, 0.0));
-    let (tail, ok) = tail_integral(u, mode, w, uw, rule, config);
-    (-0.5 * uw - I * tail, ok && is_finite(uw))
+    let (tail, ok) = tail_integral(u, op, mode, w, uw, rule, config);
+    let own = match op {
+        Op::Sum => -0.5 * uw,
+        Op::Mean => uw,
+    };
+    (own - I * tail, ok && is_finite(uw))
 }
 
-// ∫_0^∞ [u(w+it) - u(w-it)] / (e^{τt} - 1) dt; nodes ascend in t, which unwrapping needs.
+// ∫_0^∞ [u(w+it) - u(w-it)] k(t) dt, k = 1/(e^{τt} - 1) (sum) or 1/sinh(πt) (mean).
+// Nodes ascend in t, which unwrapping needs.
 fn tail_integral<G: Fn(Complex<f64>) -> Complex<f64>>(
     u: &G,
+    op: Op,
     mode: Mode,
     w: f64,
     uw: Complex<f64>,
@@ -54,7 +62,11 @@ fn tail_integral<G: Fn(Complex<f64>) -> Complex<f64>>(
             prev_up = up;
             prev_dn = dn;
         }
-        (up - dn) / (2.0 * PI * t).exp_m1()
+        let denom = match op {
+            Op::Sum => (2.0 * PI * t).exp_m1(),
+            Op::Mean => (PI * t).sinh(),
+        };
+        (up - dn) / denom
     };
 
     let mut total = KahanSum::default();
@@ -89,6 +101,7 @@ fn tail_integral<G: Fn(Complex<f64>) -> Complex<f64>>(
 
 pub struct AbelPlanaSum<F: Fn(Complex<f64>) -> Complex<f64> + Sync> {
     f: F,
+    op: Op,
     h: f64,
     s: f64,
     base: Chebyshev,
@@ -101,11 +114,12 @@ impl<F: Fn(Complex<f64>) -> Complex<f64> + Sync> AbelPlanaSum<F> {
     // Principal solution of f on [h, h + S].
     #[allow(dead_code)]
     pub fn new(f: F, h: f64, s: f64, config: &Config) -> Result<Self, String> {
-        Self::with_mode(f, Mode::Plain, h, s, config)
+        Self::build(f, Op::Sum, Mode::Plain, h, s, config)
     }
 
     // Mode::Log: f returns logarithms, e.g. Σ ln g for products.
-    pub(crate) fn with_mode(f: F, mode: Mode, h: f64, s: f64, config: &Config) -> Result<Self, String> {
+    // Op::Mean: the mean inverse; there is no integral term and no constant.
+    pub(crate) fn build(f: F, op: Op, mode: Mode, h: f64, s: f64, config: &Config) -> Result<Self, String> {
         let rule = gauss_legendre(config.gl_order);
         let u = |w: Complex<f64>| f(Complex::new(s * w.re + h, s * w.im));
 
@@ -116,17 +130,19 @@ impl<F: Fn(Complex<f64>) -> Complex<f64> + Sync> AbelPlanaSum<F> {
         let mut n = n_min;
         let mut partial: Vec<(Complex<f64>, bool)> = (0..=n)
             .into_par_iter()
-            .map(|j| base_without_integral(&u, mode, lobatto_point(n, j, 0.0, 1.0), &rule, config))
+            .map(|j| base_without_integral(&u, op, mode, lobatto_point(n, j, 0.0, 1.0), &rule, config))
             .collect();
 
         let (base, cheb_ok) = loop {
-            // Cumulative ∫_0^{w_j} u, one Gauss panel per grid gap.
+            // Sum: add the cumulative ∫_0^{w_j} u, one Gauss panel per grid gap.
             let mut cum = KahanSum::default();
             let mut values = Vec::with_capacity(n + 1);
             values.push(partial[0].0);
             for j in 1..=n {
-                let (a, b) = (lobatto_point(n, j - 1, 0.0, 1.0), lobatto_point(n, j, 0.0, 1.0));
-                cum.add(rule.integrate(a, b, |x| u(Complex::new(x, 0.0))));
+                if op == Op::Sum {
+                    let (a, b) = (lobatto_point(n, j - 1, 0.0, 1.0), lobatto_point(n, j, 0.0, 1.0));
+                    cum.add(rule.integrate(a, b, |x| u(Complex::new(x, 0.0))));
+                }
                 values.push(partial[j].0 + cum.total());
             }
             if !values.iter().all(|v| is_finite(*v)) {
@@ -135,7 +151,9 @@ impl<F: Fn(Complex<f64>) -> Complex<f64> + Sync> AbelPlanaSum<F> {
 
             let mut cheb = Chebyshev::from_lobatto_values(0.0, 1.0, &values);
             let ok = cheb.tail_ratio() <= config.cheb_tol;
-            if ok || 2 * n > n_max {
+            // refining cannot fix a tail integral that did not converge
+            let tails_ok = partial.iter().all(|&(_, t)| t);
+            if ok || 2 * n > n_max || !tails_ok {
                 cheb.chop(0.01 * config.cheb_tol);
                 break (cheb, ok);
             }
@@ -144,7 +162,7 @@ impl<F: Fn(Complex<f64>) -> Complex<f64> + Sync> AbelPlanaSum<F> {
             let n2 = 2 * n;
             let fresh: Vec<(Complex<f64>, bool)> = (0..n)
                 .into_par_iter()
-                .map(|k| base_without_integral(&u, mode, lobatto_point(n2, 2 * k + 1, 0.0, 1.0), &rule, config))
+                .map(|k| base_without_integral(&u, op, mode, lobatto_point(n2, 2 * k + 1, 0.0, 1.0), &rule, config))
                 .collect();
             let mut merged = Vec::with_capacity(n2 + 1);
             for k in 0..n {
@@ -158,20 +176,36 @@ impl<F: Fn(Complex<f64>) -> Complex<f64> + Sync> AbelPlanaSum<F> {
 
         let tail_ok = partial.iter().all(|&(_, ok)| ok);
         let max_recurrence = config.max_recurrence;
-        let c = raw_eval(&f, h, s, &base, max_recurrence, h)
-            .ok_or_else(|| "cannot compute normalization constant at x = h".to_string())?;
+        let c = match op {
+            Op::Sum => raw_eval(&f, op, h, s, &base, max_recurrence, h)
+                .ok_or_else(|| "cannot compute normalization constant at x = h".to_string())?,
+            Op::Mean => Complex::new(0.0, 0.0),
+        };
         if !is_finite(c) {
             return Err("normalization constant is non-finite".to_string());
         }
 
-        Ok(AbelPlanaSum { f, h, s, base, c, max_recurrence, converged: cheb_ok && tail_ok })
+        Ok(AbelPlanaSum { f, op, h, s, base, c, max_recurrence, converged: cheb_ok && tail_ok })
     }
 
-    // F(x) - F(h); NaN at a singularity or past max_recurrence steps.
+    // Sum: F(x) - F(h).  Mean: G(x).  NaN at a singularity or past max_recurrence steps.
     pub fn eval_raw(&self, x: f64) -> Complex<f64> {
-        raw_eval(&self.f, self.h, self.s, &self.base, self.max_recurrence, x)
+        raw_eval(&self.f, self.op, self.h, self.s, &self.base, self.max_recurrence, x)
             .map(|v| v - self.c)
             .unwrap_or(NAN)
+    }
+
+    // The operator applied to the solution at x: F(x) - F(x - S), or (G(x) + G(x - S))/2.
+    pub(crate) fn apply(&self, x: f64) -> Complex<f64> {
+        let (now, prev) = (self.eval_raw(x), self.eval_raw(x - self.s));
+        match self.op {
+            Op::Sum => now - prev,
+            Op::Mean => 0.5 * (now + prev),
+        }
+    }
+
+    pub(crate) fn op(&self) -> Op {
+        self.op
     }
 
     // Seed point of the strip [h, h + S].
@@ -199,6 +233,7 @@ impl<F: Fn(Complex<f64>) -> Complex<f64> + Sync> AbelPlanaSum<F> {
 
 fn raw_eval<F: Fn(Complex<f64>) -> Complex<f64>>(
     f: &F,
+    op: Op,
     h: f64,
     s: f64,
     base: &Chebyshev,
@@ -217,6 +252,9 @@ fn raw_eval<F: Fn(Complex<f64>) -> Complex<f64>>(
     let n = fl as i64; // |t| <= max_recurrence, so this is exact
     let r = t - fl;
     let u = |v: f64| f(Complex::new(s * v + h, 0.0));
+    if op == Op::Mean {
+        return mean_recurrence(&u, base, t, n, r);
+    }
 
     let mut acc = KahanSum::default();
     if n >= 0 {
@@ -241,6 +279,33 @@ fn raw_eval<F: Fn(Complex<f64>) -> Complex<f64>>(
         acc.add(u(r));
         Some(acc.total())
     }
+}
+
+// G(y + nS) = (-1)^n G(y) + 2 Σ_{k=1}^{n} (-1)^{n-k} f(y + kS),
+// G(y - mS) = (-1)^m G(y) + 2 Σ_{j=0}^{m-1} (-1)^{m-1-j} f(y - jS),  y = h + rS.
+fn mean_recurrence<U: Fn(f64) -> Complex<f64>>(u: &U, base: &Chebyshev, t: f64, n: i64, r: f64) -> Option<Complex<f64>> {
+    let parity = |k: i64| if k % 2 == 0 { 1.0 } else { -1.0 };
+    let mut acc = KahanSum::default();
+    if n >= 0 {
+        for k in 1..=n {
+            let term = u(t - (n - k) as f64);
+            if !is_finite(term) {
+                return None;
+            }
+            acc.add(2.0 * parity(n - k) * term);
+        }
+    } else {
+        let m = -n;
+        for j in 0..m {
+            let term = u(r - j as f64);
+            if !is_finite(term) {
+                return None;
+            }
+            acc.add(2.0 * parity(m - 1 - j) * term);
+        }
+    }
+    acc.add(parity(n) * base.eval(r));
+    Some(acc.total())
 }
 
 #[cfg(test)]
@@ -317,6 +382,93 @@ mod tests {
         assert!(op.eval_raw(f64::NAN).re.is_nan());
         assert!(op.eval_raw(1e300).re.is_nan());
         assert!(op.eval_raw(-1e300).re.is_nan());
+    }
+
+    fn mean_op<F: Fn(Complex<f64>) -> Complex<f64> + Sync>(f: F, h: f64, s: f64) -> AbelPlanaSum<F> {
+        let op = AbelPlanaSum::build(f, Op::Mean, Mode::Plain, h, s, &Config::default()).expect("build");
+        assert!(op.converged(), "did not converge");
+        op
+    }
+
+    fn c(re: f64) -> Complex<f64> {
+        Complex::new(re, 0.0)
+    }
+
+    // Abel-Plana (1/sinh kernel) against Euler summation of 2 Σ (-1)^{k-1} f(x + kS) (Gray).
+    fn plana_matches_gray<F: Fn(Complex<f64>) -> Complex<f64> + Sync + Clone>(f: F, h: f64, s: f64, xs: &[f64]) {
+        let op = mean_op(f.clone(), h, s);
+        let cfg = Config::default();
+        for &x in xs {
+            let g = op.eval_raw(x);
+            let fx = f(c(x));
+            assert!((op.apply(x) - fx).norm() <= 1e-10 * fx.norm().max(g.norm()).max(1.0), "x={x}: residual");
+            let gray = crate::gray::mean_inverse(&f, x, s, cfg.gray_max_terms, cfg.gray_tol);
+            assert!((g - gray).norm() <= 1e-10 * g.norm().max(1.0), "h={h} S={s} x={x}: plana {g} vs gray {gray}");
+        }
+    }
+
+    #[test]
+    fn mean_plana_matches_gray() {
+        let one = c(1.0);
+        plana_matches_gray(move |z: Complex<f64>| one / (z * z + one), 0.5, 0.7, &[1.3, 0.2, 4.9, -2.1]);
+        plana_matches_gray(|z: Complex<f64>| z * z * z - 2.0 * z, -0.3, 1.0, &[0.4, 3.75, -5.2]);
+        plana_matches_gray(|z: Complex<f64>| (2.0 * z).sin(), 0.1, 1.0, &[0.6, 2.9, -1.3]);
+        plana_matches_gray(move |z: Complex<f64>| (z + one).powf(0.5), 0.2, 0.7, &[1.3, 3.0, 0.5]);
+        plana_matches_gray(|z: Complex<f64>| (-0.5 * z).exp() * z.cos(), 0.1, 1.0, &[0.6, 2.9, -1.3]);
+        plana_matches_gray(|z: Complex<f64>| z.powf(2.5), 0.3, 1.0, &[0.8, 6.1]);
+        plana_matches_gray(move |z: Complex<f64>| one / z, 0.3, 0.7, &[0.8, 6.1, 0.15]);
+        // reference from SciPy quad on the 1/sinh form and the alternating series
+        let g = mean_op(move |z: Complex<f64>| one / (z * z + one), 0.5, 0.7).eval_raw(1.3);
+        assert!((g.re - 0.252992555294).abs() < 1e-12 && g.im.abs() < 1e-14, "{g}");
+    }
+
+    #[test]
+    fn mean_has_no_free_constant() {
+        // Two strips right of the poles of 1/(z² + 1) give the same G, not G + const.
+        let one = c(1.0);
+        let f = move |z: Complex<f64>| one / (z * z + one);
+        let (a, b) = (mean_op(f, 0.5, 1.0), mean_op(f, 2.3, 1.0));
+        for &x in &[0.7, 1.9, 5.5, -3.2] {
+            assert!((a.eval_raw(x) - b.eval_raw(x)).norm() < 1e-12, "x={x}");
+        }
+    }
+
+    #[test]
+    fn mean_strip_left_of_a_pole_is_another_solution() {
+        // 1/(z - 5): both strips solve the equation, they differ by an antiperiodic function;
+        // the strip right of the pole is the alternating series.
+        let f = |z: Complex<f64>| c(1.0) / (z - c(5.0));
+        let s = 0.7;
+        let (left, right) = (mean_op(f, 0.6, s), mean_op(f, 5.6, s));
+        let cfg = Config::default();
+        for &x in &[1.3, 3.1, 7.2] {
+            for op in [&left, &right] {
+                assert!((op.apply(x) - f(c(x))).norm() < 1e-11, "x={x}: residual");
+            }
+            let gray = crate::gray::mean_inverse(&f, x, s, cfg.gray_max_terms, cfg.gray_tol);
+            assert!((right.eval_raw(x) - gray).norm() < 1e-10 * gray.norm().max(1.0), "x={x}");
+            assert!((left.eval_raw(x) - gray).norm() > 1e-3, "x={x}");
+        }
+    }
+
+    #[test]
+    fn mean_of_square_is_euler_polynomial() {
+        // M^{-1} x² = S² E_2(x/S + 1), E_2(u) = u² - u
+        let s = 0.7;
+        let op = mean_op(|z: Complex<f64>| z * z, 0.1, s);
+        for &x in &[0.4, 3.3, -6.0] {
+            let u = x / s + 1.0;
+            let exact = s * s * (u * u - u);
+            assert!((op.eval_raw(x) - c(exact)).norm() < 1e-11 * exact.abs().max(1.0), "x={x}");
+        }
+    }
+
+    #[test]
+    fn mean_rejects_type_pi() {
+        // e^{iπz/S} is antiperiodic: the 1/sinh tail does not converge
+        let f = |z: Complex<f64>| (Complex::new(0.0, PI) * z).exp();
+        let built = AbelPlanaSum::build(f, Op::Mean, Mode::Plain, 0.1, 1.0, &Config::default());
+        assert!(built.map(|op| !op.converged()).unwrap_or(true));
     }
 
     #[test]

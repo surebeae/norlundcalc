@@ -5,9 +5,12 @@ use num_complex::Complex;
 use rayon::prelude::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SumKind {
     Sum,
     Product,
+    // Mean inverse (Wechselsumme): (G(x) + G(x - S))/2 = f(x).
+    Mean,
 }
 
 fn validate_params(step: f64, h: Option<f64>, a: Option<f64>) -> Result<(), CalcError> {
@@ -39,6 +42,32 @@ impl Calculator {
 
     pub fn product(expr: &str, step: f64, h: Option<f64>, a: Option<f64>, force: bool) -> Result<Self, CalcError> {
         Self::product_with_config(expr, step, h, a, force, &Config::default())
+    }
+
+    // Mean inverse; no zero point, since the solution has no free constant.
+    pub fn mean(expr: &str, step: f64, h: Option<f64>, force: bool) -> Result<Self, CalcError> {
+        Self::mean_with_config(expr, step, h, force, &Config::default())
+    }
+
+    pub fn mean_with_config(
+        expr: &str,
+        step: f64,
+        h: Option<f64>,
+        force: bool,
+        config: &Config,
+    ) -> Result<Self, CalcError> {
+        validate_params(step, h, None)?;
+        let built = crate::term::build_mean(expr, step, h, config, force).map_err(|e| match e {
+            CalcError::BuildFailed(m) => CalcError::BuildFailed(format!("could not build mean inverse: {m}")),
+            other => other,
+        })?;
+        Ok(Calculator {
+            evaluator: built.eval,
+            kind: SumKind::Mean,
+            zero_point: f64::NAN,
+            seed: built.h,
+            domain: built.domain,
+        })
     }
 
     pub fn sum_with_config(
@@ -103,6 +132,7 @@ impl Calculator {
         xs.par_iter().map(|&x| self.eval(x).unwrap_or(Complex::new(f64::NAN, f64::NAN))).collect()
     }
 
+    // NaN for a mean inverse.
     pub fn zero_point(&self) -> f64 {
         self.zero_point
     }
@@ -111,7 +141,7 @@ impl Calculator {
         self.kind
     }
 
-    // Left edge h of the seed strip [h, h + S] that was used.
+    // Left edge h of the seed strip [h, h + S] that was used (NaN for the gray engine).
     pub fn seed(&self) -> f64 {
         self.seed
     }
@@ -129,8 +159,19 @@ pub fn build_sum_raw(
     a: Option<f64>,
     force: bool,
 ) -> Result<Box<dyn Fn(f64) -> Complex<f64> + Send + Sync>, CalcError> {
+    build_sum_raw_with_config(expr, step, h, a, force, &Config::default())
+}
+
+pub fn build_sum_raw_with_config(
+    expr: &str,
+    step: f64,
+    h: Option<f64>,
+    a: Option<f64>,
+    force: bool,
+    config: &Config,
+) -> Result<Box<dyn Fn(f64) -> Complex<f64> + Send + Sync>, CalcError> {
     validate_params(step, h, a)?;
-    crate::term::build_sum(expr, step, h, a, &Config::default(), force).map(|b| b.eval).map_err(|e| match e {
+    crate::term::build_sum(expr, step, h, a, config, force).map(|b| b.eval).map_err(|e| match e {
         CalcError::BuildFailed(m) => CalcError::BuildFailed(format!("could not build indefinite sum: {m}")),
         other => other,
     })

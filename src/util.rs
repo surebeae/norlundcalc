@@ -8,6 +8,13 @@ pub(crate) fn is_finite(z: Complex<f64>) -> bool {
 
 pub(crate) const NAN: Complex<f64> = Complex::new(f64::NAN, f64::NAN);
 
+// Sum: F(x) - F(x - S) = f(x).  Mean: (G(x) + G(x - S))/2 = f(x), the Wechselsumme.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Op {
+    Sum,
+    Mean,
+}
+
 // e^z - 1 without cancellation for small |z|.
 pub(crate) fn expm1(z: Complex<f64>) -> Complex<f64> {
     let (x, y) = (z.re, z.im);

@@ -4,6 +4,7 @@ mod cheb;
 mod classify;
 mod error;
 mod expsum;
+mod gray;
 pub mod limits;
 mod mono;
 mod quadrature;
@@ -11,9 +12,9 @@ mod term;
 mod util;
 mod validation;
 
-pub use calc::{build_sum_raw, Calculator, SumKind};
+pub use calc::{build_sum_raw, build_sum_raw_with_config, Calculator, SumKind};
 pub use error::CalcError;
-pub use validation::Config;
+pub use validation::{Config, Engine};
 
 // Calculator is shared across threads (eval_many, Python).
 const _: () = {
@@ -41,6 +42,7 @@ mod python {
         inner: Arc<Calculator>,
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build(
         py: Python<'_>,
         expr: &str,
@@ -49,12 +51,18 @@ mod python {
         a: Option<f64>,
         force: bool,
         product: bool,
+        mean: bool,
     ) -> PyResult<PyCalculator> {
+        if mean && (product || a.is_some()) {
+            return Err(PyValueError::new_err("mean takes neither product nor a"));
+        }
         let expr = expr.to_owned();
         // Release the GIL while building.
         let calc = py
             .detach(move || {
-                if product {
+                if mean {
+                    Calculator::mean(&expr, step, h, force)
+                } else if product {
                     Calculator::product(&expr, step, h, a, force)
                 } else {
                     Calculator::sum(&expr, step, h, a, force)
@@ -67,7 +75,8 @@ mod python {
     #[pymethods]
     impl PyCalculator {
         #[new]
-        #[pyo3(signature = (expr, *, step=1.0, h=None, a=None, force=false, product=false))]
+        #[pyo3(signature = (expr, *, step=1.0, h=None, a=None, force=false, product=false, mean=false))]
+        #[allow(clippy::too_many_arguments)]
         fn new(
             py: Python<'_>,
             expr: &str,
@@ -76,8 +85,9 @@ mod python {
             a: Option<f64>,
             force: bool,
             product: bool,
+            mean: bool,
         ) -> PyResult<Self> {
-            build(py, expr, step, h, a, force, product)
+            build(py, expr, step, h, a, force, product, mean)
         }
 
         fn __call__(&self, py: Python<'_>, x: f64) -> PyResult<Complex<f64>> {
@@ -112,7 +122,7 @@ mod python {
     #[pyfunction]
     #[pyo3(signature = (expr, *, step=1.0, h=None, a=None, force=false))]
     pub fn sum(py: Python<'_>, expr: &str, step: f64, h: Option<f64>, a: Option<f64>, force: bool) -> PyResult<PyCalculator> {
-        build(py, expr, step, h, a, force, false)
+        build(py, expr, step, h, a, force, false, false)
     }
 
     #[pyfunction]
@@ -125,7 +135,14 @@ mod python {
         a: Option<f64>,
         force: bool,
     ) -> PyResult<PyCalculator> {
-        build(py, expr, step, h, a, force, true)
+        build(py, expr, step, h, a, force, true, false)
+    }
+
+    // Mean inverse (Wechselsumme): (G(x) + G(x - step))/2 = f(x).
+    #[pyfunction]
+    #[pyo3(signature = (expr, *, step=1.0, h=None, force=false))]
+    pub fn mean(py: Python<'_>, expr: &str, step: f64, h: Option<f64>, force: bool) -> PyResult<PyCalculator> {
+        build(py, expr, step, h, None, force, false, true)
     }
 
     #[pymodule]
@@ -136,6 +153,9 @@ mod python {
 
         #[pymodule_export]
         use super::product;
+
+        #[pymodule_export]
+        use super::mean;
 
         #[pymodule_export]
         use super::PyCalculator;
