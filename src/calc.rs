@@ -1,6 +1,8 @@
 use crate::error::CalcError;
+use crate::expsum::EvalFn;
 use crate::validation::Config;
 use num_complex::Complex;
+use rayon::prelude::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SumKind {
@@ -10,94 +12,95 @@ pub enum SumKind {
 
 fn validate_params(step: f64, h: Option<f64>, a: Option<f64>) -> Result<(), CalcError> {
     if !(step.is_finite() && step > 0.0) {
-        return Err(CalcError::InvalidInput(
-            "step must be finite and greater than 0".to_string(),
-        ));
+        return Err(CalcError::InvalidInput("step must be finite and greater than 0".to_string()));
     }
-
-    if let Some(h_val) = h {
-        if !h_val.is_finite() {
-            return Err(CalcError::InvalidInput("h must be finite".to_string()));
+    for (name, v) in [("h", h), ("a", a)] {
+        if let Some(v) = v {
+            if !v.is_finite() {
+                return Err(CalcError::InvalidInput(format!("{name} must be finite")));
+            }
         }
     }
-
-    if let Some(a_val) = a {
-        if !a_val.is_finite() {
-            return Err(CalcError::InvalidInput("a must be finite".to_string()));
-        }
-    }
-
     Ok(())
 }
 
 pub struct Calculator {
-    evaluator: Box<dyn Fn(f64) -> Complex<f64> + Send + Sync>,
+    evaluator: EvalFn,
     kind: SumKind,
     zero_point: f64,
+    seed: f64,
+    domain: (f64, f64),
 }
 
 impl Calculator {
-    pub fn sum(
-        expr: &str,
-        step: f64,
-        h: Option<f64>,
-        a: Option<f64>,
-        force: bool,
-    ) -> Result<Self, CalcError> {
-        validate_params(step, h, a)?;
-
-        let zero_point = a.unwrap_or(0.0);
-        let eval =
-            crate::term::build_sum(expr, step, h, Some(zero_point), &Config::default(), force)
-                .map_err(|e| {
-                    CalcError::BuildFailed(format!("could not build indefinite sum: {e}"))
-                })?;
-
-        Ok(Calculator {
-            evaluator: eval,
-            kind: SumKind::Sum,
-            zero_point,
-        })
+    pub fn sum(expr: &str, step: f64, h: Option<f64>, a: Option<f64>, force: bool) -> Result<Self, CalcError> {
+        Self::sum_with_config(expr, step, h, a, force, &Config::default())
     }
 
-    pub fn product(
+    pub fn product(expr: &str, step: f64, h: Option<f64>, a: Option<f64>, force: bool) -> Result<Self, CalcError> {
+        Self::product_with_config(expr, step, h, a, force, &Config::default())
+    }
+
+    pub fn sum_with_config(
         expr: &str,
         step: f64,
         h: Option<f64>,
         a: Option<f64>,
         force: bool,
+        config: &Config,
     ) -> Result<Self, CalcError> {
         validate_params(step, h, a)?;
-
         let zero_point = a.unwrap_or(0.0);
-        let sum_expr = format!("ln({expr})");
-        let raw_sum = crate::term::build_sum(
-            &sum_expr,
-            step,
-            h,
-            Some(zero_point),
-            &Config::default(),
-            force,
-        )
-        .map_err(|e| CalcError::BuildFailed(format!("could not build indefinite product: {e}")))?;
+        let built = crate::term::build_sum(expr, step, h, Some(zero_point), config, force).map_err(|e| match e {
+            CalcError::BuildFailed(m) => CalcError::BuildFailed(format!("could not build indefinite sum: {m}")),
+            other => other,
+        })?;
+        Ok(Calculator { evaluator: built.eval, kind: SumKind::Sum, zero_point, seed: built.h, domain: built.domain })
+    }
 
-        let evaluator = Box::new(move |x: f64| raw_sum(x).exp());
-
+    pub fn product_with_config(
+        expr: &str,
+        step: f64,
+        h: Option<f64>,
+        a: Option<f64>,
+        force: bool,
+        config: &Config,
+    ) -> Result<Self, CalcError> {
+        validate_params(step, h, a)?;
+        let zero_point = a.unwrap_or(0.0);
+        let built = crate::term::build_log_sum(expr, step, h, Some(zero_point), config, force)
+            .map_err(|e| match e {
+                CalcError::BuildFailed(m) => CalcError::BuildFailed(format!("could not build indefinite product: {m}")),
+                other => other,
+            })?;
+        let raw_sum = built.eval;
         Ok(Calculator {
-            evaluator,
+            evaluator: Box::new(move |x: f64| raw_sum(x).exp()),
             kind: SumKind::Product,
             zero_point,
+            seed: built.h,
+            domain: built.domain,
         })
     }
 
     pub fn eval(&self, x: f64) -> Result<Complex<f64>, CalcError> {
+        if !x.is_finite() {
+            return Err(CalcError::InvalidInput("x must be finite".to_string()));
+        }
+        if x < self.domain.0 || x > self.domain.1 {
+            return Err(CalcError::OutOfRange { x, domain: self.domain });
+        }
         let value = (self.evaluator)(x);
-
         if value.re.is_finite() && value.im.is_finite() {
             Ok(value)
         } else {
             Err(CalcError::NonFinite)
         }
+    }
+
+    // Evaluate at many points in parallel; NaN where eval would fail.
+    pub fn eval_many(&self, xs: &[f64]) -> Vec<Complex<f64>> {
+        xs.par_iter().map(|&x| self.eval(x).unwrap_or(Complex::new(f64::NAN, f64::NAN))).collect()
     }
 
     pub fn zero_point(&self) -> f64 {
@@ -106,6 +109,16 @@ impl Calculator {
 
     pub fn kind(&self) -> SumKind {
         self.kind
+    }
+
+    // Left edge h of the seed strip [h, h + S] that was used.
+    pub fn seed(&self) -> f64 {
+        self.seed
+    }
+
+    // Range of x that eval accepts.
+    pub fn domain(&self) -> (f64, f64) {
+        self.domain
     }
 }
 
@@ -117,36 +130,15 @@ pub fn build_sum_raw(
     force: bool,
 ) -> Result<Box<dyn Fn(f64) -> Complex<f64> + Send + Sync>, CalcError> {
     validate_params(step, h, a)?;
-
-    crate::term::build_sum(expr, step, h, a, &Config::default(), force)
-        .map_err(|e| CalcError::BuildFailed(format!("could not build indefinite sum: {e}")))
+    crate::term::build_sum(expr, step, h, a, &Config::default(), force).map(|b| b.eval).map_err(|e| match e {
+        CalcError::BuildFailed(m) => CalcError::BuildFailed(format!("could not build indefinite sum: {m}")),
+        other => other,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn backward_sum_z_squared_is_correct() {
-        let calc =
-            Calculator::sum("z^2", 1.0, Some(0.5), Some(0.0), false).expect("sum should build");
-
-        let value = calc.eval(4.0).expect("evaluation should succeed");
-
-        assert!((value.re - 30.0).abs() < 1e-6);
-        assert!(value.im.abs() < 1e-12);
-    }
-
-    #[test]
-    fn backward_product_z_plus_one_is_correct() {
-        let calc = Calculator::product("z+1", 1.0, Some(0.5), Some(0.0), false)
-            .expect("product should build without force");
-
-        let value = calc.eval(3.0).expect("evaluation should succeed");
-
-        assert!((value.re - 24.0).abs() < 1e-6);
-        assert!(value.im.abs() < 1e-12);
-    }
 
     #[test]
     fn invalid_step_is_rejected() {

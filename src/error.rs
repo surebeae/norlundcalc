@@ -1,10 +1,13 @@
 use std::fmt;
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum CalcError {
     BuildFailed(String),
     NonFinite,
     InvalidInput(String),
+    // x is farther from the seed strip than the recurrence limit allows.
+    OutOfRange { x: f64, domain: (f64, f64) },
 }
 
 impl fmt::Display for CalcError {
@@ -13,6 +16,11 @@ impl fmt::Display for CalcError {
             CalcError::BuildFailed(msg) => write!(f, "build failed: {msg}"),
             CalcError::NonFinite => write!(f, "evaluation produced non-finite value"),
             CalcError::InvalidInput(msg) => write!(f, "invalid input: {msg}"),
+            CalcError::OutOfRange { x, domain } => write!(
+                f,
+                "x = {x} is outside the reachable range [{}, {}] (raise Config::max_recurrence to extend it)",
+                domain.0, domain.1
+            ),
         }
     }
 }

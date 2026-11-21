@@ -1,565 +1,395 @@
-use crate::abel::AbelPlanaSum;
+use crate::abel::{AbelPlanaSum, Mode};
+use crate::util::is_finite;
 use num_complex::Complex;
+use rayon::prelude::*;
 use std::f64::consts::PI;
 
-#[derive(Clone)]
+// Numerical parameters; start from Config::default().
+#[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct Config {
-    pub y_max: f64,
-    pub spline_nodes: usize,
+    // Gauss-Legendre order per panel.
     pub gl_order: usize,
-    pub peak_sub: usize,
-    pub smooth_sub: usize,
+    // Upper limit of the Abel-Plana tail integral, in units of the step.
+    pub tail_y_cap: f64,
+    // Tail panels below this fraction of the running total are negligible.
+    pub tail_rel_tol: f64,
+    // Initial and maximal degree of the Chebyshev base interpolant.
+    pub cheb_min_degree: usize,
+    pub cheb_max_degree: usize,
+    // Required decay of the trailing Chebyshev coefficients.
+    pub cheb_tol: f64,
+    // Height of the region scanned for singularities during validation.
     pub contour_half_height: f64,
     pub decay_ymax: f64,
     pub decay_n_points: usize,
     pub decay_tolerance: f64,
+    // Max recurrence steps per evaluation; bounds the work for large |x|.
+    pub max_recurrence: u64,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
-            y_max: 14.0,
-            spline_nodes: 400,
             gl_order: 16,
-            peak_sub: 50,
-            smooth_sub: 150,
+            tail_y_cap: 60.0,
+            tail_rel_tol: 1e-17,
+            cheb_min_degree: 32,
+            cheb_max_degree: 512,
+            cheb_tol: 1e-13,
             contour_half_height: 30.0,
             decay_ymax: 60.0,
             decay_n_points: 8,
             decay_tolerance: 1e-2,
+            max_recurrence: 1 << 24,
         }
     }
 }
 
-fn strip_has_singularity<F: Fn(Complex<f64>) -> Complex<f64> + Sync>(
-    f: &F,
-    h: f64,
-    s: f64,
-    verbose: bool,
-) -> bool {
+type CF = Complex<f64>;
+
+#[inline]
+fn bad(v: CF) -> bool {
+    !is_finite(v)
+}
+
+fn strip_has_singularity<F: Fn(CF) -> CF + Sync>(f: &F, h: f64, s: f64, verbose: bool) -> bool {
     let delta = 1e-6;
     let n = 200;
     let dx = 1e-3;
-
-    for i in 0..=n {
+    (0..=n).into_par_iter().any(|i| {
         let x = h + s * (i as f64 / n as f64);
-        let zp = Complex::new(x, delta);
-        let zm = Complex::new(x, -delta);
-        let fp = f(zp);
-        let fm = f(zm);
-
-        if !fp.re.is_finite() || !fp.im.is_finite() || !fm.re.is_finite() || !fm.im.is_finite() {
+        let fp = f(Complex::new(x, delta));
+        let fm = f(Complex::new(x, -delta));
+        if bad(fp) || bad(fm) || fp.norm() > 1e10 || fm.norm() > 1e10 {
             if verbose {
-                println!("    [singularity] non-finite at x={:.6}", x);
+                eprintln!("    [singularity] near x={x:.6}");
             }
             return true;
         }
-
-        if fp.norm() > 1e10 || fm.norm() > 1e10 {
-            if verbose {
-                println!("    [singularity] |f| > 1e10 at x={:.6}", x);
-            }
-            return true;
-        }
-
         let f_mid = f(Complex::new(x, 0.0));
         let f_right = f(Complex::new(x + dx, 0.0));
         let f_left = f(Complex::new(x - dx, 0.0));
-
-        if !f_right.re.is_finite()
-            || !f_right.im.is_finite()
-            || !f_left.re.is_finite()
-            || !f_left.im.is_finite()
-            || !f_mid.re.is_finite()
-            || !f_mid.im.is_finite()
-        {
-            if verbose {
-                println!("    [singularity] non-finite in 2nd diff at x={:.6}", x);
-            }
+        if bad(f_mid) || bad(f_right) || bad(f_left) {
             return true;
         }
-
         let d2 = (f_right - 2.0 * f_mid + f_left).norm() / (dx * dx);
         if d2 > 1e4 {
             if verbose {
-                println!("    [singularity] |f''| > 1e4 at x={:.6}", x);
+                eprintln!("    [singularity] |f''| > 1e4 at x={x:.6}");
             }
             return true;
         }
-    }
-
-    false
+        false
+    })
 }
 
-fn strip_has_pole_near_axis<F: Fn(Complex<f64>) -> Complex<f64> + Sync>(
-    f: &F,
-    h: f64,
-    s: f64,
-    verbose: bool,
-) -> bool {
-    // 40 points instead of 10 so a pole at a "nice" x-value inside the strip
-    // (e.g. z = i for 1/(z^2+1) with h = -1.4, s = 4, where x = 0) is sampled
-    // rather than falling between grid points.
+fn strip_has_pole_near_axis<F: Fn(CF) -> CF + Sync>(f: &F, h: f64, s: f64, verbose: bool) -> bool {
+    // 40 x-points so a pole at a "nice" x inside the strip is sampled, e.g.
+    // z = i for 1/(z^2+1) with h = -1.4, S = 4, where x = 0.
     let n_x = 40;
-    let y_range = 6.0;
-    let y_step = 0.02;
-
-    for i in 0..=n_x {
+    let n_y = 600; // y ∈ [-6, 6], step 0.02
+    (0..=n_x).into_par_iter().any(|i| {
         let x = h + s * (i as f64 / n_x as f64);
-        let mut y = -y_range;
-
-        while y <= y_range {
+        (0..=n_y).any(|j| {
+            let y = -6.0 + 12.0 * j as f64 / n_y as f64;
             let val = f(Complex::new(x, y));
-
-            if !val.re.is_finite() || !val.im.is_finite() || val.norm() > 1e10 {
-                if verbose {
-                    println!("        [pole detected] at ({:.6},{:.6})", x, y);
-                }
-                return true;
+            let hit = bad(val) || val.norm() > 1e10;
+            if hit && verbose {
+                eprintln!("        [pole detected] at ({x:.6},{y:.6})");
             }
-
-            y += y_step;
-        }
-    }
-
-    false
+            hit
+        })
+    })
 }
 
-fn strip_is_safe<F: Fn(Complex<f64>) -> Complex<f64> + Sync>(
-    f: &F,
-    h: f64,
-    s: f64,
-    config: &Config,
-    verbose: bool,
-) -> bool {
-    if strip_has_singularity(f, h, s, verbose) {
+fn strip_is_safe<F: Fn(CF) -> CF + Sync>(f: &F, h: f64, s: f64, config: &Config, verbose: bool) -> bool {
+    if strip_has_singularity(f, h, s, verbose) || strip_has_pole_near_axis(f, h, s, verbose) {
         return false;
     }
-
-    if strip_has_pole_near_axis(f, h, s, verbose) {
-        if verbose {
-            println!("    [fail] pole found near real axis inside strip");
-        }
-        return false;
-    }
-
     let m = config.contour_half_height;
     let n_real = 100;
-    // 120 points instead of 50 so y = 1.0 is sampled (needed to catch the pole
-    // of 1/(z^2+1) at z = i for h = -1.4, s = 4).
-    let n_imag = 120;
-
-    for i in 0..=n_real {
+    // 120 steps on [0, 30] so y = 1 is sampled (the pole of 1/(z^2+1) at z = i
+    // for h = -1.4, S = 4).
+    let n_imag: i32 = 120;
+    let non_finite = (0..=n_real).into_par_iter().any(|i| {
         let x = h + s * (i as f64 / n_real as f64);
-
-        for j in -n_imag..=n_imag {
-            let y = m * (j as f64 / n_imag as f64);
-            let z = Complex::new(x, y);
-            let val = f(z);
-
-            if !val.re.is_finite() || !val.im.is_finite() {
-                if verbose {
-                    println!("        [non-finite] at ({:.6},{:.6})", x, y);
-                }
-                return false;
-            }
+        (-n_imag..=n_imag).any(|j| bad(f(Complex::new(x, m * (j as f64 / n_imag as f64)))))
+    });
+    if non_finite {
+        if verbose {
+            eprintln!("        [non-finite] in scan region");
         }
+        return false;
     }
-
     let delta = 1e-4;
-
-    for i in 0..=n_real {
+    let rough = (0..=n_real).into_par_iter().any(|i| {
         let x = h + s * (i as f64 / n_real as f64);
-        let zp = Complex::new(x, delta);
-        let zm = Complex::new(x, -delta);
-        let fp = f(zp);
-        let fm = f(zm);
-
-        if !fp.re.is_finite() || !fp.im.is_finite() || !fm.re.is_finite() || !fm.im.is_finite() {
-            if verbose {
-                println!("        [non-finite] near real axis at x={:.6}", x);
-            }
-            return false;
-        }
-
-        let diff = (fp - fm).norm();
-        let scale = fp.norm().max(fm.norm()).max(1.0);
-
-        if diff > 1e3 * scale {
-            if verbose {
-                println!("        [rough derivative] at x={:.6}", x);
-            }
-            return false;
-        }
-    }
-
-    true
+        let fp = f(Complex::new(x, delta));
+        let fm = f(Complex::new(x, -delta));
+        bad(fp) || bad(fm) || (fp - fm).norm() > 1e3 * fp.norm().max(fm.norm()).max(1.0)
+    });
+    !rough
 }
 
-fn passes_decay_test<F: Fn(Complex<f64>) -> Complex<f64> + Sync>(
-    f: &F,
-    _h: f64,
-    s: f64,
-    x_points: &[f64],
-    y_values: &[f64],
-    tolerance: f64,
-    verbose: bool,
-) -> bool {
-    for &x in x_points {
-        for &y in y_values {
+fn validate_decay<F: Fn(CF) -> CF + Sync>(f: &F, h: f64, s: f64, config: &Config, verbose: bool) -> bool {
+    let n_x = 5;
+    let y_min = config.contour_half_height.max(5.0);
+    let y_max = config.decay_ymax.max(y_min);
+    let n = config.decay_n_points.max(2);
+    for i in 0..=n_x {
+        let x = h + s * (i as f64 / n_x as f64);
+        for k in 0..n {
+            let y = y_min * (y_max / y_min).powf(k as f64 / (n as f64 - 1.0));
             let z = Complex::new(x, y);
-            let dz = f(z + Complex::new(s, 0.0)) - f(z);
-            let mag = dz.norm();
-
+            let mag = (f(z + Complex::new(s, 0.0)) - f(z)).norm();
             if !mag.is_finite() || mag <= 0.0 {
                 continue;
             }
-
             let rate = mag.ln() / y;
-
-            if rate >= 2.0 * PI - tolerance {
+            if rate >= 2.0 * PI - config.decay_tolerance {
                 if verbose {
-                    println!("        [exponential type] rate={:.6} at x={:.6}", rate, x);
+                    eprintln!("    [fail] exponential type ≥ τ (rate={rate:.6} at x={x:.6})");
                 }
                 return false;
             }
         }
     }
-
     true
 }
 
-fn validate_strip_safety<F: Fn(Complex<f64>) -> Complex<f64> + Sync>(
+fn validate_self_consistency<F: Fn(CF) -> CF + Sync, G: Fn(CF) -> CF + Sync>(
     f: &F,
     h: f64,
     s: f64,
-    config: &Config,
+    op: &AbelPlanaSum<G>,
     verbose: bool,
 ) -> bool {
-    if !strip_is_safe(f, h, s, config, verbose) {
-        if verbose {
-            println!("    [fail] strip validation");
-        }
-        return false;
-    }
-
-    true
-}
-
-fn validate_decay<F: Fn(Complex<f64>) -> Complex<f64> + Sync>(
-    f: &F,
-    h: f64,
-    s: f64,
-    config: &Config,
-    verbose: bool,
-) -> bool {
-    let n_x = 5;
-    let x_points: Vec<f64> = (0..=n_x).map(|i| h + s * (i as f64 / n_x as f64)).collect();
-
-    let y_min = config.contour_half_height.max(5.0);
-    let y_max = config.decay_ymax;
-    let n = config.decay_n_points;
-    let y_vals: Vec<f64> = (0..n)
-        .map(|i| {
-            let t = i as f64 / (n as f64 - 1.0);
-            y_min * (y_max / y_min).powf(t)
-        })
-        .collect();
-
-    if !passes_decay_test(f, h, s, &x_points, &y_vals, config.decay_tolerance, verbose) {
-        if verbose {
-            println!("    [fail] exponential type ≥ 2π");
-        }
-        return false;
-    }
-
-    true
-}
-
-fn validate_self_consistency<F: Fn(Complex<f64>) -> Complex<f64> + Sync + Clone>(
-    f: &F,
-    h: f64,
-    s: f64,
-    sum_op: &AbelPlanaSum<impl Fn(Complex<f64>) -> Complex<f64> + Sync>,
-    verbose: bool,
-) -> bool {
-    let f_scaled = |x: f64| f(Complex::new(s * x + h, 0.0));
-
+    // F(x) - F(x - S) = f(x) at x = h + S·{0.2, ..., 0.8}; holds by construction.
     for i in 0..5 {
-        let z = 0.2 + 0.15 * (i as f64);
-        let fz = f_scaled(z);
-
-        if !fz.re.is_finite() || !fz.im.is_finite() {
+        let x = h + s * (0.2 + 0.15 * i as f64);
+        let fx = f(Complex::new(x, 0.0));
+        if bad(fx) {
             continue;
         }
-
-        let fwd = sum_op.eval_raw(z);
-        let bwd = sum_op.eval_raw(z - 1.0);
-        let diff = (fwd - bwd - fz).norm();
-
-        if diff > 1e-8 * fz.norm().max(1.0) {
+        let diff = (op.eval_raw(x) - op.eval_raw(x - s) - fx).norm();
+        if diff > 1e-8 * fx.norm().max(1.0) {
             if verbose {
-                println!("    [fail] self-check of F at z={:.3}", z);
+                eprintln!("    [fail] self-check of F at x={x:.3}");
             }
             return false;
         }
     }
-
     true
 }
 
-fn check_continuity<F: Fn(Complex<f64>) -> Complex<f64> + Sync>(
+fn check_continuity<F: Fn(CF) -> CF + Sync, G: Fn(CF) -> CF + Sync>(
     f: &F,
-    sum_op: &AbelPlanaSum<impl Fn(Complex<f64>) -> Complex<f64> + Sync>,
+    op: &AbelPlanaSum<G>,
     base: f64,
     epsilon: f64,
     h: f64,
     s: f64,
-    skip_on_f_singular: bool,
 ) -> bool {
-    if skip_on_f_singular {
-        let t = (base - h) / s;
-        let probe_singular = |x: f64| -> bool {
-            let v = f(Complex::new(x, 0.0));
-            !v.re.is_finite() || !v.im.is_finite() || v.norm() >= 1e6
-        };
-
-        if t >= 0.0 {
-            let n = t.floor() as usize;
-            for k in 0..=n {
-                let x = base - k as f64 * s;
-                if probe_singular(x) {
-                    return true;
-                }
-            }
-        } else {
-            let n = (-t).floor() as usize;
-            for k in 1..=n {
-                let x = base + k as f64 * s;
-                if probe_singular(x) {
-                    return true;
-                }
-            }
-        }
+    // A singularity of f on the recurrence path is a legitimate pole of F.
+    let t = (base - h) / s;
+    let probe = |x: f64| {
+        let v = f(Complex::new(x, 0.0));
+        bad(v) || v.norm() >= 1e6
+    };
+    let n = t.abs().floor() as usize;
+    let singular = if t >= 0.0 { (0..=n).any(|k| probe(base - k as f64 * s)) } else { (1..=n).any(|k| probe(base + k as f64 * s)) };
+    if singular {
+        return true;
     }
-
-    let f_plus = sum_op.eval_raw((base + epsilon - h) / s);
-    let f_minus = sum_op.eval_raw((base - epsilon - h) / s);
-
-    if !f_plus.re.is_finite()
-        || !f_plus.im.is_finite()
-        || !f_minus.re.is_finite()
-        || !f_minus.im.is_finite()
-    {
+    let f_plus = op.eval_raw(base + epsilon);
+    let f_minus = op.eval_raw(base - epsilon);
+    if bad(f_plus) || bad(f_minus) {
         return false;
     }
-
     if f_plus.norm() >= 1e6 || f_minus.norm() >= 1e6 {
         return true;
     }
-
-    let diff = (f_plus - f_minus).norm();
     let scale = f_plus.norm().max(f_minus.norm()).max(1.0);
-    diff / scale.max(1e-12) <= 5e-3
+    (f_plus - f_minus).norm() / scale <= 5e-3
 }
 
-fn validate_jump_discontinuities<F: Fn(Complex<f64>) -> Complex<f64> + Sync>(
+fn validate_jump_discontinuities<F: Fn(CF) -> CF + Sync, G: Fn(CF) -> CF + Sync>(
     f: &F,
     h: f64,
     s: f64,
-    sum_op: &AbelPlanaSum<impl Fn(Complex<f64>) -> Complex<f64> + Sync>,
+    op: &AbelPlanaSum<G>,
 ) -> bool {
     let epsilon = 1e-4;
-
-    // Chosen strip boundaries: x = h + m*s
+    // Strip boundaries x = h + m·S.
     for m in 1..=4 {
-        let mut sum_has_pole = false;
-
-        for k in 1..=m {
-            let val = f(Complex::new(h + k as f64 * s, 0.0));
-            if !val.re.is_finite() || !val.im.is_finite() {
-                sum_has_pole = true;
-                break;
-            }
-        }
-
-        if sum_has_pole {
-            continue;
-        }
-
-        let base = h + m as f64 * s;
-        if !check_continuity(f, sum_op, base, epsilon, h, s, true) {
+        let pole_on_path = (1..=m).any(|k| bad(f(Complex::new(h + k as f64 * s, 0.0))));
+        if !pole_on_path && !check_continuity(f, op, h + m as f64 * s, epsilon, h, s) {
             return false;
         }
     }
-
-    // recurrence boundaries: x = k*s and at x = h + m*s
-    // The base spline is sampled on [-1, 0] in t-coordinates, so it spans
-    // x in [h - s, h]. If a pole contaminates the Abel-Plana integral that
-    // builds the spline, the resulting error propagates through the recurrence
-    // to discontinuities at both the chosen strip boundaries (h + m*s) and
-    // the canonical boundaries k*s. Nørlund Ch. 4 S3 requires the principal
-    // solution to be continuous across the entire recurrence, not only at
-    // the strip boundaries.
+    // Recurrence boundaries x = k·S (Nørlund Kap. 4 §3: continuous across the whole recurrence).
     let k_min = (h / s).floor() as i64 - 2;
     let k_max = ((h + s) / s).ceil() as i64 + 2;
-
-    for k in k_min..=k_max {
-        let base = k as f64 * s;
-        if !check_continuity(f, sum_op, base, epsilon, h, s, true) {
-            return false;
-        }
-    }
-
-    true
+    (k_min..=k_max).all(|k| check_continuity(f, op, k as f64 * s, epsilon, h, s))
 }
 
-fn validate_discrete_sums<F: Fn(Complex<f64>) -> Complex<f64> + Sync>(
+fn validate_discrete_sums<F: Fn(CF) -> CF + Sync, G: Fn(CF) -> CF + Sync>(
     f: &F,
     h: f64,
     s: f64,
-    sum_op: &AbelPlanaSum<impl Fn(Complex<f64>) -> Complex<f64> + Sync>,
+    op: &AbelPlanaSum<G>,
     verbose: bool,
 ) -> bool {
-    let eval_f = |x: f64| sum_op.eval_raw((x - h) / s);
+    // F(h + m·S) - F(h) = Σ f(h + k·S); holds by construction, catches evaluation failures.
     let mut any_ok = false;
-
+    let mut disc = Complex::new(0.0, 0.0);
     for m in 1..=10 {
-        let x_val = h + m as f64 * s;
-        let disc = (1..=m)
-            .map(|k| f(Complex::new(s * k as f64 + h, 0.0)))
-            .fold(Complex::new(0.0, 0.0), |a, b| a + b);
-
-        if !disc.re.is_finite() || !disc.im.is_finite() {
+        disc += f(Complex::new(h + s * m as f64, 0.0));
+        if bad(disc) {
+            break;
+        }
+        let ana = op.eval_raw(h + m as f64 * s);
+        if bad(ana) {
             continue;
         }
-
-        let ana = eval_f(x_val);
-
-        if !ana.re.is_finite() || !ana.im.is_finite() {
-            continue;
-        }
-
         let diff = (ana - disc).norm();
-        let mag = disc.norm().max(1.0);
-
-        if diff > 1e-6 * mag && diff > 1e-8 {
+        if diff > 1e-6 * disc.norm().max(1.0) && diff > 1e-8 {
             if verbose {
-                println!("    [fail] mismatch at m={}: disc={}, ana={}", m, disc, ana);
+                eprintln!("    [fail] mismatch at m={m}: disc={disc}, ana={ana}");
             }
             return false;
         }
-
         any_ok = true;
     }
-
     if !any_ok && verbose {
-        println!("    [fail] no non-singular test points");
+        eprintln!("    [fail] no non-singular test points");
     }
-
     any_ok
 }
 
-fn test_candidate_verbose<F>(f_user: &F, h: f64, s: f64, config: &Config, verbose: bool) -> bool
+// Validate the seed strip [h, h+S] and, on success, return the operator built on it.
+pub(crate) fn validate_candidate<F>(
+    g: &F,
+    mode: Mode,
+    h: f64,
+    s: f64,
+    config: &Config,
+    verbose: bool,
+) -> Option<AbelPlanaSum<F>>
 where
-    F: Fn(Complex<f64>) -> Complex<f64> + Sync + Clone,
+    F: Fn(CF) -> CF + Sync + Clone,
 {
-    if !validate_strip_safety(f_user, h, s, config, verbose) {
-        return false;
+    let f = g;
+    // cheapest first
+    if !validate_decay(f, h, s, config, verbose) {
+        return None;
     }
-
-    if !validate_decay(f_user, h, s, config, verbose) {
-        return false;
+    if !strip_is_safe(f, h, s, config, verbose) {
+        if verbose {
+            eprintln!("    [fail] strip validation");
+        }
+        return None;
     }
-
-    let g = {
-        let f = f_user.clone();
-        move |z: Complex<f64>| f(Complex::new(s * z.re + h, s * z.im))
-    };
-
-    let sum_op = match AbelPlanaSum::new(g, 0.0, 1.0, config.clone()) {
+    let op = match AbelPlanaSum::with_mode(g.clone(), mode, h, s, config) {
         Ok(op) => op,
         Err(e) => {
             if verbose {
-                println!("    [fail] could not build indefinite sum: {e}");
+                eprintln!("    [fail] could not build indefinite sum: {e}");
             }
-            return false;
+            return None;
         }
     };
-
-    if !validate_self_consistency(f_user, h, s, &sum_op, verbose) {
-        return false;
+    if !op.converged() {
+        if verbose {
+            eprintln!("    [fail] Abel–Plana base or tail did not converge");
+        }
+        return None;
     }
-
-    if !validate_jump_discontinuities(f_user, h, s, &sum_op) {
-        return false;
+    if validate_self_consistency(f, h, s, &op, verbose)
+        && validate_jump_discontinuities(f, h, s, &op)
+        && validate_discrete_sums(f, h, s, &op, verbose)
+    {
+        Some(op)
+    } else {
+        None
     }
-
-    if !validate_discrete_sums(f_user, h, s, &sum_op, verbose) {
-        return false;
-    }
-
-    true
 }
 
-pub(crate) fn validate_candidate<F>(f: &F, h: f64, s: f64, config: &Config, verbose: bool) -> bool
+// Search for a valid seed strip; returns it with its operator.
+pub(crate) fn auto_find_h<F>(
+    f: &F,
+    mode: Mode,
+    s: f64,
+    config: &Config,
+    verbose: bool,
+) -> Option<(f64, AbelPlanaSum<F>)>
 where
-    F: Fn(Complex<f64>) -> Complex<f64> + Sync + Clone,
-{
-    test_candidate_verbose(f, h, s, config, verbose)
-}
-
-pub(crate) fn auto_find_h_verbose<F>(f: &F, s: f64, config: &Config, verbose: bool) -> Option<f64>
-where
-    F: Fn(Complex<f64>) -> Complex<f64> + Sync + Clone,
+    F: Fn(CF) -> CF + Sync + Clone,
 {
     let fixed = [0.1, -0.5, 1.3, -3.4, 10.5];
-
-    if verbose {
-        println!("Automatic h search (step S = {s}) …");
-    }
-
-    for &h in &fixed {
-        if verbose {
-            print!("  trying h = {:>6.2} ... ", h);
-        }
-
-        if test_candidate_verbose(f, h, s, config, verbose) {
-            if verbose {
-                println!("   success.");
-            }
-            return Some(h);
-        }
-    }
-
-    if verbose {
-        println!("  trying random shifts in [-30, 30] …");
-    }
-
+    // Then 50 values in [-30, 30] from a fixed-seed LCG (Knuth's MMIX constants).
     let mut seed = 12345u64;
+    let random = std::iter::repeat_with(move || {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        -30.0 + (seed as f64 / u64::MAX as f64) * 60.0
+    })
+    .take(50);
 
-    for _ in 0..50 {
-        seed = seed
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-
-        let h = -30.0 + (seed as f64 / u64::MAX as f64) * 60.0;
-
+    for h in fixed.into_iter().chain(random) {
         if verbose {
-            print!("  trying h = {:>6.2} ... ", h);
+            eprintln!("  trying h = {h:>6.2} ...");
         }
-
-        if test_candidate_verbose(f, h, s, config, verbose) {
-            if verbose {
-                println!("   success.");
-            }
-            return Some(h);
+        if let Some(op) = validate_candidate(f, mode, h, s, config, verbose) {
+            return Some((h, op));
         }
     }
-
-    if verbose {
-        println!("Automatic h search failed.");
-    }
-
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn finds_strip_for_rational_function() {
+        let f = |z: CF| Complex::new(1.0, 0.0) / (z * z + Complex::new(1.0, 0.0));
+        let (h, op) = auto_find_h(&f, Mode::Plain, 1.0, &Config::default(), false).expect("strip");
+        let x = h + 3.3;
+        let d = op.eval_raw(x) - op.eval_raw(x - 1.0) - f(Complex::new(x, 0.0));
+        assert!(d.norm() < 1e-10);
+    }
+
+    #[test]
+    fn rejects_type_two_pi() {
+        // e^{τiz/S} sits at the resonance: exponential type exactly τ
+        let f = |z: CF| (Complex::new(0.0, 2.0 * PI) * z).exp();
+        assert!(validate_candidate(&f, Mode::Plain, 0.1, 1.0, &Config::default(), false).is_none());
+    }
+
+    // Two valid strips agree up to a constant; the principal branch of ln does not.
+    #[test]
+    fn log_mode_continues_branch_along_rays() {
+        let g = |z: CF| (z * z).sin().ln();
+        let cfg = Config::default();
+        let a = validate_candidate(&g, Mode::Log, 0.1, 1.0, &cfg, false).expect("strip at 0.1");
+        let b = validate_candidate(&g, Mode::Log, 0.3, 1.0, &cfg, false).expect("strip at 0.3");
+        let d0 = a.eval_raw(0.7) - b.eval_raw(0.7);
+        for &x in &[0.45, 1.05, 1.6, 2.9, -0.6] {
+            let d = a.eval_raw(x) - b.eval_raw(x) - d0;
+            // compare exp(F): integer multiples of τi on the real axis are irrelevant
+            let rel = (d.exp() - Complex::new(1.0, 0.0)).norm();
+            assert!(rel < 1e-10, "x={x}: strips disagree by {rel:e}");
+        }
+        // the principal branch along the rays does not converge
+        let principal = |z: CF| (z * z).sin().ln();
+        let op = AbelPlanaSum::new(principal, 0.1, 1.0, &cfg).unwrap();
+        assert!(!op.converged());
+    }
+
+    #[test]
+    fn rejects_strip_with_pole() {
+        let f = |z: CF| Complex::new(1.0, 0.0) / (z - Complex::new(0.5, 0.0));
+        assert!(validate_candidate(&f, Mode::Plain, 0.1, 1.0, &Config::default(), false).is_none());
+    }
 }

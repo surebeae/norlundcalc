@@ -1,230 +1,105 @@
-use crate::abel::AbelPlanaSum;
+use crate::abel::{AbelPlanaSum, Mode};
+use crate::classify::{self, Term};
 use crate::error::CalcError;
-use crate::form;
-use crate::mono::{digamma, Branch, MonomialSum, EULER_MASCHERONI};
-use crate::validation::{auto_find_h_verbose, validate_candidate, Config};
+use crate::expsum::EvalFn;
+use crate::mono::{Branch, LogAffineSum, MonomialSum};
+use crate::util::{is_finite, KahanSum, NAN};
+use crate::validation::{auto_find_h, validate_candidate, Config};
+use formulac::{CompiledFormula, Scratch};
 use num_complex::Complex;
 use std::cell::RefCell;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
-type EvalFn = Box<dyn Fn(f64) -> Complex<f64> + Send + Sync>;
+// A generic term ready for evaluation: coeff · formula(z), or ln formula(z) if log.
+struct GenericPart {
+    coeff: Complex<f64>,
+    formula: CompiledFormula<f64, 1>,
+    log: bool,
+    // Process-unique id; keys the per-thread scratch buffer.
+    id: u64,
+}
+
+static NEXT_FORMULA_ID: AtomicU64 = AtomicU64::new(1);
+// Per-thread scratch buffers, bounded.
+const SCRATCH_CACHE_CAP: usize = 64;
 
 thread_local! {
-    static SCRATCH: RefCell<Option<formulac::Scratch<f64>>> = const { RefCell::new(None) };
+    // A scratch buffer belongs to one formula, so they are keyed by id.
+    static SCRATCH: RefCell<Vec<(u64, Scratch<f64>)>> = const { RefCell::new(Vec::new()) };
 }
 
-fn formulac_eval(
-    compiled: formulac::CompiledFormula<f64, 1>,
-) -> impl Fn(Complex<f64>) -> Complex<f64> + Send + Sync + Clone {
-    move |z| {
-        SCRATCH.with(|cell| {
-            let mut slot = cell.borrow_mut();
-            let scratch = slot.get_or_insert_with(|| compiled.new_scratch());
-            compiled.eval_with_scratch(&[z], scratch)
-        })
-    }
-}
-
-/// Split an expression into signed terms
-pub(crate) fn split_into_terms(expr: &str) -> Vec<(f64, String)> {
-    let mut terms = Vec::new();
-    let chars: Vec<char> = expr.chars().collect();
-    let n = chars.len();
-    let mut depth = 0;
-    let mut start = 0;
-    let mut sign = 1.0_f64;
-    let mut i = 0;
-
-    while i < n {
-        match chars[i] {
-            '(' => depth += 1,
-            ')' => {
-                if depth > 0 {
-                    depth -= 1;
-                }
-            }
-            '+' | '-' if depth == 0 => {
-                // Unary signs after these operators are not separators:
-                //   z^-2, 2*-3, z/-2
-                if i > 0 && matches!(chars[i - 1], '^' | '*' | '/') {
-                    i += 1;
-                    continue;
-                }
-
-                // Skip signs that are part of scientific notation,
-                // e.g. 1e-5 or 1E+5
-                if i > 0
-                    && (chars[i - 1] == 'e' || chars[i - 1] == 'E')
-                    && i >= 2
-                    && (chars[i - 2].is_ascii_digit() || chars[i - 2] == '.')
-                {
-                    i += 1;
-                    continue;
-                }
-
-                if i == start && chars[i] == '-' {
-                    sign = -1.0;
-                    start = i + 1;
-                    i += 1;
-                    continue;
-                }
-
-                if i == start && chars[i] == '+' {
-                    start = i + 1;
-                    i += 1;
-                    continue;
-                }
-
-                let term_str: String = chars[start..i].iter().collect();
-                let trimmed = term_str.trim();
-
-                if !trimmed.is_empty() {
-                    terms.push((sign, trimmed.to_string()));
-                }
-
-                sign = if chars[i] == '+' { 1.0 } else { -1.0 };
-                start = i + 1;
-            }
-            _ => {}
-        }
-
-        i += 1;
-    }
-
-    if start < n {
-        let term_str: String = chars[start..].iter().collect();
-        let trimmed = term_str.trim();
-
-        if !trimmed.is_empty() {
-            terms.push((sign, trimmed.to_string()));
-        }
-    }
-
-    terms
-}
-
-/// Catch `coeff * z^p` or `coeff * z^(p)`
-fn parse_monomial(term: &str) -> Option<(f64, f64)> {
-    let term = term.trim().replace(" ", "");
-
-    if let Some(pos) = term.rfind("z^") {
-        let after = &term[pos + 2..];
-
-        if after.starts_with('(') && after.ends_with(')') {
-            let inside = &after[1..after.len() - 1];
-
-            if inside.is_empty() {
-                return None;
-            }
-
-            let p: f64 = inside.parse().ok()?;
-            let coeff_str = &term[..pos];
-
-            let coeff = if coeff_str.is_empty() || coeff_str == "+" {
-                1.0
-            } else if coeff_str == "-" {
-                -1.0
-            } else if let Some(stripped) = coeff_str.strip_suffix('*') {
-                stripped.parse().ok()?
-            } else {
-                coeff_str.parse().ok()?
-            };
-
-            return Some((coeff, p));
-        }
-
-        if after.is_empty() {
-            return None;
-        }
-
-        let p: f64 = after.parse().ok()?;
-        let coeff_str = &term[..pos];
-
-        let coeff = if coeff_str.is_empty() || coeff_str == "+" {
-            1.0
-        } else if coeff_str == "-" {
-            -1.0
-        } else if let Some(stripped) = coeff_str.strip_suffix('*') {
-            stripped.parse().ok()?
-        } else {
-            coeff_str.parse().ok()?
+#[inline]
+fn eval_part(part: &GenericPart, z: Complex<f64>) -> Complex<f64> {
+    SCRATCH.with(|cell| {
+        let Ok(mut cache) = cell.try_borrow_mut() else {
+            // Re-entrant call: evaluate without scratch.
+            return part.formula.eval(&[z]);
         };
+        let idx = match cache.iter().position(|(id, _)| *id == part.id) {
+            Some(i) => i,
+            None => {
+                if cache.len() >= SCRATCH_CACHE_CAP {
+                    cache.swap_remove(0);
+                }
+                cache.push((part.id, part.formula.new_scratch()));
+                cache.len() - 1
+            }
+        };
+        part.formula.eval_with_scratch(&[z], &mut cache[idx].1)
+    })
+}
 
-        return Some((coeff, p));
+fn generic_function(parts: Vec<GenericPart>) -> impl Fn(Complex<f64>) -> Complex<f64> + Send + Sync + Clone {
+    let parts: Arc<[GenericPart]> = parts.into();
+    move |z| {
+        let mut acc = Complex::new(0.0, 0.0);
+        for p in parts.iter() {
+            let v = eval_part(p, z);
+            acc += if p.log { v.ln() } else { p.coeff * v };
+        }
+        acc
     }
-
-    None
 }
 
-fn term_uses_abel_plana(term: &str) -> bool {
-    form::try_closed_form(term, 1.0, 0.0).is_none() && parse_monomial(term).is_none()
-}
-
-/// Single term evaluator
-pub(crate) fn build_term(
-    term_str: &str,
+// Validated on the user's strip, unvalidated with force, or on a searched strip.
+fn build_operator<F>(
+    f: F,
+    mode: Mode,
+    what: &str,
     s: f64,
-    h: f64,
+    h_opt: Option<f64>,
     config: &Config,
     force: bool,
-) -> Result<EvalFn, CalcError> {
-    if let Some(cf) = form::try_closed_form(term_str, s, h) {
-        return Ok(cf);
+) -> Result<AbelPlanaSum<F>, CalcError>
+where
+    F: Fn(Complex<f64>) -> Complex<f64> + Send + Sync + Clone,
+{
+    match h_opt {
+        Some(h) if force => AbelPlanaSum::with_mode(f, mode, h, s, config)
+            .map_err(|e| CalcError::BuildFailed(format!("could not sum `{what}`: {e}"))),
+        Some(h) => validate_candidate(&f, mode, h, s, config, false).ok_or_else(|| {
+            CalcError::BuildFailed(format!(
+                "validation failed for `{what}` on the strip [{h}, {}]; choose another h, or pass force to skip validation",
+                h + s
+            ))
+        }),
+        None => auto_find_h(&f, mode, s, config, false)
+            .map(|(_, op)| op)
+            .ok_or_else(|| CalcError::BuildFailed(format!("automatic h search failed for `{what}`"))),
     }
-
-    if let Some((coeff, p)) = parse_monomial(term_str) {
-        if (p + 1.0).abs() < 1e-12 {
-            let branch_right = h > -s / 2.0;
-
-            let closure = move |x: f64| -> Complex<f64> {
-                let val = if branch_right {
-                    digamma(x / s + 1.0) + EULER_MASCHERONI
-                } else {
-                    digamma(-x / s) + EULER_MASCHERONI
-                };
-
-                Complex::new(coeff * val / s, 0.0)
-            };
-
-            return Ok(Box::new(closure));
-        }
-
-        let branch = if h > -s / 2.0 {
-            Branch::Right
-        } else {
-            Branch::Left
-        };
-
-        let mono = MonomialSum::new(p, s, branch).map_err(CalcError::BuildFailed)?;
-        let closure = move |x: f64| -> Complex<f64> { coeff * mono.eval_raw(x) };
-
-        return Ok(Box::new(closure));
-    }
-
-    let analytic_expr = term_str.replace("log(", "ln(");
-    let compiled = formulac::Builder::<f64, 1>::new(&analytic_expr, ["z"])
-        .compile()
-        .map_err(|e| {
-            CalcError::BuildFailed(format!("could not compile term `{term_str}`: {e:?}"))
-        })?;
-
-    let f = formulac_eval(compiled);
-
-    if !force && !validate_candidate(&f, h, s, config, false) {
-        return Err(CalcError::BuildFailed(format!(
-            "validation failed for term `{term_str}`"
-        )));
-    }
-
-    let abel = AbelPlanaSum::new(f, h, s, config.clone()).map_err(CalcError::BuildFailed)?;
-    let closure = move |x: f64| -> Complex<f64> { abel.eval_raw(x) };
-
-    Ok(Box::new(closure))
 }
 
-/// Build the raw sum of all terms
-///
-/// If `a` is provided, shift the result so `F(a) = 0`
-/// Otherwise return the unshifted sum
+// The assembled principal solution.
+pub(crate) struct BuiltSum {
+    pub(crate) eval: EvalFn,
+    // Seed point actually used (user-supplied or found).
+    pub(crate) h: f64,
+    // x range reachable within the recurrence limit.
+    pub(crate) domain: (f64, f64),
+}
+
+// Raw sum of expr. If a is given, shift so that F(a) = 0.
 pub(crate) fn build_sum(
     expr: &str,
     s: f64,
@@ -232,127 +107,109 @@ pub(crate) fn build_sum(
     a: Option<f64>,
     config: &Config,
     force: bool,
-) -> Result<EvalFn, CalcError> {
-    let terms = split_into_terms(expr);
+) -> Result<BuiltSum, CalcError> {
+    assemble(classify::classify(expr, s)?, s, h_opt, a, config, force)
+}
 
-    // Only terms that actually need Abel–Plana should participate in the
-    // automatic strip anchor search. Closed forms and monomials are handled
-    // directly and must not force validation of the whole expression.
-    let generic_terms: Vec<&(f64, String)> = terms
-        .iter()
-        .filter(|(_, term)| term_uses_abel_plana(term))
-        .collect();
+// Raw sum of ln(expr), for products. If a is given, F(a) = 0.
+pub(crate) fn build_log_sum(
+    expr: &str,
+    s: f64,
+    h_opt: Option<f64>,
+    a: Option<f64>,
+    config: &Config,
+    force: bool,
+) -> Result<BuiltSum, CalcError> {
+    assemble(classify::classify_product(expr, s)?, s, h_opt, a, config, force)
+}
 
-    let compiled_full = if generic_terms.is_empty() {
-        None
-    } else {
-        let generic_expr = generic_terms
-            .iter()
-            .map(|(coeff, term)| {
-                if *coeff == 1.0 {
-                    term.clone()
-                } else if *coeff == -1.0 {
-                    format!("-({term})")
-                } else {
-                    format!("{coeff}*({term})")
-                }
-            })
-            .collect::<Vec<_>>()
-            .join(" + ")
-            .replace("log(", "ln(");
-
-        formulac::Builder::<f64, 1>::new(&generic_expr, ["z"])
-            .compile()
-            .ok()
-    };
-
-    let global_h = if let Some(h_user) = h_opt {
-        h_user
-    } else {
-        match compiled_full {
-            Some(c) => {
-                let f_whole = formulac_eval(c);
-                auto_find_h_verbose(&f_whole, s, config, false).ok_or_else(|| {
-                    CalcError::BuildFailed("automatic h search failed".to_string())
-                })?
+fn assemble(
+    terms: Vec<Term>,
+    s: f64,
+    h_opt: Option<f64>,
+    a: Option<f64>,
+    config: &Config,
+    force: bool,
+) -> Result<BuiltSum, CalcError> {
+    let mut parts: Vec<EvalFn> = Vec::new();
+    let mut monomials = Vec::new();
+    let mut log_affine = Vec::new();
+    let mut generic = Vec::new();
+    let mut generic_text = Vec::new();
+    let mut mode = Mode::Plain;
+    for term in terms {
+        let id = || NEXT_FORMULA_ID.fetch_add(1, Ordering::Relaxed);
+        match term {
+            Term::Closed(f) => parts.push(f),
+            Term::Monomial { coeff, power, a, b } => monomials.push((coeff, power, a, b)),
+            Term::LogAffine { coeff, a, b } => log_affine.push((coeff, a, b)),
+            Term::Generic { coeff, formula, text } => {
+                generic_text.push(text);
+                generic.push(GenericPart { coeff, formula, log: false, id: id() });
             }
-            None => 0.0,
+            Term::LogGeneric { formula, text } => {
+                generic_text.push(format!("ln({text})"));
+                generic.push(GenericPart { coeff: Complex::new(1.0, 0.0), formula, log: true, id: id() });
+                mode = Mode::Log;
+            }
         }
-    };
-
-    let mut term_evals: Vec<(f64, EvalFn)> = Vec::new();
-
-    for (coeff, term) in &terms {
-        let eval = build_term(term, s, global_h, config, force)
-            .map_err(|e| CalcError::BuildFailed(format!("could not build term `{term}`: {e}")))?;
-
-        term_evals.push((*coeff, eval));
     }
 
-    if term_evals.is_empty() {
-        return Err(CalcError::BuildFailed(
-            "no terms could be built".to_string(),
-        ));
+    let mut domain = (f64::NEG_INFINITY, f64::INFINITY);
+    let global_h = if generic.is_empty() {
+        h_opt.unwrap_or(0.0)
+    } else {
+        let what = generic_text.join(" + ");
+        let op = build_operator(generic_function(generic), mode, &what, s, h_opt, config, force)?;
+        domain = op.domain();
+        let h = op.h();
+        parts.push(Box::new(move |x| op.eval_raw(x)));
+        h
+    };
+
+    // Right branch if the strip [h, h+S] lies right of the singularity at -b/a.
+    let branch = |shift: f64| if global_h + shift > -s / 2.0 { Branch::Right } else { Branch::Left };
+    for (coeff, power, a_lin, b_lin) in monomials {
+        // (a z + b)^p = a^p (z + b/a)^p for a > 0, or for integer p.
+        let shift = b_lin / a_lin;
+        let factor = if power == power.round() { a_lin.powi(power as i32) } else { a_lin.powf(power) };
+        let mono = MonomialSum::new(power, s, branch(shift), config.max_recurrence).map_err(CalcError::BuildFailed)?;
+        let k = coeff * factor;
+        parts.push(Box::new(move |x| k * mono.eval_raw(x + shift)));
+    }
+    for (coeff, a_lin, b_lin) in log_affine {
+        let lg = LogAffineSum::new(coeff, a_lin, b_lin, s, branch(b_lin / a_lin)).map_err(CalcError::BuildFailed)?;
+        parts.push(Box::new(move |x| lg.eval_raw(x)));
+    }
+
+    if parts.is_empty() {
+        return Err(CalcError::BuildFailed("no terms could be built".to_string()));
     }
 
     let raw_sum = move |x: f64| -> Complex<f64> {
-        let mut total = Complex::new(0.0, 0.0);
-
-        for (coeff, eval) in &term_evals {
-            let val = coeff * eval(x);
-
-            if val.re.is_finite() && val.im.is_finite() {
-                total += val;
-            } else {
-                return Complex::new(f64::NAN, f64::NAN);
+        let mut acc = KahanSum::default();
+        for p in &parts {
+            let v = p(x);
+            if !is_finite(v) {
+                return NAN;
             }
+            acc.add(v);
         }
-
-        total
+        acc.total()
     };
 
-    if let Some(a_val) = a {
-        let offset = raw_sum(a_val);
-
-        if !offset.re.is_finite() || !offset.im.is_finite() {
-            return Err(CalcError::BuildFailed(format!(
-                "offset at a={a_val} is non-finite"
-            )));
+    let eval: EvalFn = match a {
+        Some(a_val) => {
+            let offset = raw_sum(a_val);
+            if !is_finite(offset) {
+                return Err(CalcError::BuildFailed(format!(
+                    "F is non-finite at a = {a_val} (a singularity, or outside the reachable range {domain:?})"
+                )));
+            }
+            Box::new(move |x| raw_sum(x) - offset)
         }
+        None => Box::new(raw_sum),
+    };
 
-        let shifted = move |x: f64| -> Complex<f64> { raw_sum(x) - offset };
-        Ok(Box::new(shifted))
-    } else {
-        Ok(Box::new(raw_sum))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn split_keeps_negative_exponent_together() {
-        let terms = split_into_terms("z^-2");
-
-        assert_eq!(terms.len(), 1);
-        assert_eq!(terms[0].0, 1.0);
-        assert_eq!(terms[0].1, "z^-2");
-    }
-
-    #[test]
-    fn split_handles_mixed_terms() {
-        let terms = split_into_terms("z^2 + z^-1 - 3");
-
-        assert_eq!(terms.len(), 3);
-        assert_eq!(terms[0].1, "z^2");
-        assert_eq!(terms[1].1, "z^-1");
-        assert_eq!(terms[2].1, "3");
-        assert_eq!(terms[2].0, -1.0);
-    }
-
-    #[test]
-    fn parse_monomial_accepts_negative_exponent_without_parens() {
-        assert_eq!(parse_monomial("z^-2"), Some((1.0, -2.0)));
-    }
+    Ok(BuiltSum { eval, h: global_h, domain })
 }
