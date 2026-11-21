@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Optional, Sequence
 
 
 class Calculator:
@@ -12,9 +12,23 @@ class Calculator:
         force: bool = False,
         product: bool = False,
     ) -> None: ...
-    def __call__(self, x: float) -> complex: ...
+    def __call__(self, x: float) -> complex:
+        """Raises ValueError for non-finite x or a non-finite result, and
+        OverflowError when x is outside `domain`."""
+        ...
+    def eval_many(self, xs: Sequence[float]) -> list[complex]:
+        """Parallel evaluation without the GIL; nan+nanj where __call__ would raise."""
+        ...
     @property
     def zero_point(self) -> float: ...
+    @property
+    def seed(self) -> float:
+        """Left edge h of the seed strip [h, h + step] that was used."""
+        ...
+    @property
+    def domain(self) -> tuple[float, float]:
+        """Range of x accepted by __call__."""
+        ...
 
 
 def sum(

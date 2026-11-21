@@ -14,7 +14,7 @@ The project provides:
 - a Rust library,
 - a Python package with bindings.
 
-Indefinite products are implemented. Series-expansion fallback is planned but not yet implemented.
+Indefinite products are implemented, with closed forms for known factors. Series-expansion fallback is planned but not yet implemented.
 
 ## Notation
 
@@ -49,21 +49,26 @@ In both examples the zero point is $a=0$. The program may use a different $a$ vi
 
 ## Indefinite products
 
-With `--product`, the program computes
+With `--product`, the program computes the principal solution of
 
 $$
-G(z) - G(z - S) = \ln f(z)
+F(z) - F(z - S) = \ln f(z)
 $$
 
-and then exponentiates:
-
-$$
-G(z) = \exp(F(z)),
-$$
-
-where $F$ is the Nørlund principal indefinite sum of $\ln f(z)$.
+and exponentiates, $G(z) = \exp(F(z))$, so $G(z) / G(z - S) = f(z)$.
 
 The zero point defaults to $a = 0$, so $G(0) = 1$.
+
+$f$ is split into top level factors, and the logarithm of each known factor is summed in closed form:
+
+| factor | $\ln$ factor | summed with |
+|---|---|---|
+| constant $c$ | $\ln c$ | $\frac{x}{S}\ln c$ |
+| $(az+b)^p$, $a>0$ (including $z$, $az+b$) | $p\ln(az+b)$ | $\ln\Pi$ ($\Pi(t)=\Gamma(t+1)$) |
+| $e^{g(z)}$ | $g(z)$ | the sum path for $g$ |
+| $c^{g(z)}$, $c>0$ | $g(z)\ln c$ | the sum path for $g$ |
+
+Any other factor $h$ goes through Abel–Plana as $\ln h$, continued along the tail rays so that branch cuts of the principal logarithm do not enter. Several such factors share one Abel–Plana build.
 
 Example:
 
@@ -74,10 +79,10 @@ cargo run --release -- --function "z+1" --product --xmin -4 --xmax 10
 This computes the backward indefinite product
 
 $$
-G(x) = \prod_{k=1}^{x} (k + 1)
+G(x) = \prod_{k=1}^{x} (k + 1) = \Pi(x+1)
 $$
 
-for step size $S = 1$.
+for step size $S = 1$, in closed form.
 
 ---
 
@@ -109,9 +114,14 @@ print(G(3.0))   # (24+0j)
 calc = norlundcalc.Calculator("sin(z*z)", a=0.0)
 print(calc(2.5))
 
-# Access the selected zero point
-print(calc.zero_point)
+# Access the selected zero point, seed strip and evaluable range
+print(calc.zero_point, calc.seed, calc.domain)
+
+# Many points at once, in parallel and without the GIL (nan+nanj at poles)
+print(calc.eval_many([0.5, 1.5, 2.5]))
 ```
+
+`calc(x)` raises `ValueError` for a non-finite `x` or result, and `OverflowError` for `x` outside `calc.domain`.
 
 All keyword arguments after `expr` are optional:
 
@@ -124,7 +134,7 @@ Calculator(expr, *, step=1.0, h=None, a=None, force=False, product=False)
 If `h` is omitted, the automatic strip search is used.
 
 In the Python bindings, if `a` is `None` or omitted, the zero point defaults to `0.0`.
-This differs from the CLI, where omitting `--a` triggers automatic zero-point detection.
+In the CLI, `--product` defaults `--a` to `0.0`, while sums pick the first finite point near `[xmin - 10, xmax + 10]` when `--a` is omitted.
 
 ---
 
@@ -142,14 +152,19 @@ fn main() -> Result<(), norlundcalc::CalcError> {
     let product = Calculator::product("z+1", 1.0, None, Some(0.0), false)?;
     let value = product.eval(3.0)?; // 24 + 0i
 
+    let values = sum.eval_many(&[0.5, 1.5, 2.5]); // parallel, NaN where eval fails
+    let (lo, hi) = sum.domain(); // x range eval accepts
+
     Ok(())
 }
 ```
 
+`Calculator::sum_with_config` and `product_with_config` take a `Config` (start from `Config::default()`).
+
 ## Cargo features
 
 - `default = ["cli"]`: enables PNG/terminal plotting for the CLI binary.
-- `cli`: includes `kuva`, `image`, `icy_sixel`, and `terminal_size`.
+- `cli`: includes `tiny-skia`, `fontdue`, `png`, and `rustix`. Plot labels use `assets/TerminusTTF-4.49.3.ttf` (see `assets/COPYING`), embedded at build time.
 - `python`: enables the PyO3 bindings; used automatically by `maturin`.
 
 To build only the core Rust library without plotting or Python dependencies:
@@ -175,10 +190,16 @@ cargo build --lib --features python --no-default-features
   --function, -f <expr> Function to sum
   --xmin, --xmax        Plot range
   --ymin, --ymax        y-axis limits
-  --no-display          Skip sixel terminal preview and plotting
-  --force               Skip per-term validation with fixed --h
+  --points <n>          Samples on [xmin, xmax], default 2400, max 1000000
+  --out-dir <dir>       Where CSV/PNG files go, default .
+  --png-scale <k>       PNG size k x 2400x1600, default 2, max 3, 0 = no PNG
+  --no-display          Disable PNG rendering and sixel terminal preview
+  --force               Skip strip validation (with --h; the search still validates)
   --product             Compute an indefinite product via exp(sum(ln(f)))
+  -h, --help            Usage
 ```
+
+The sixel preview is drawn at the terminal's pixel size (`TIOCGWINSZ`) and only when stdout is a terminal. `NORLUNDCALC_TIMING=1` prints stage timings to stderr.
 
 Example:
 
@@ -186,24 +207,24 @@ Example:
 cargo run --release -- --function "sin(z*z)" --xmin -4 --xmax 19
 ```
 
-Produces:
+Produces, in `--out-dir`:
 
-- `indefinite_sum.png`
+- `indefinite_sum.png` (unless `--png-scale 0` or `--no-display`)
 - `indefinite_sum.csv`
 - `discrete_sums.csv`
-- optional sixel terminal preview
+- a sixel terminal preview (unless `--no-display`)
 
 ---
 
 ## Compilation
 
 ```
-git clone https://codeberg.org/AzulBeae/norlundcalc.git
+git clone https://github.com/surebeae/norlundcalc
 cd norlundcalc
 cargo build --release
 ```
 
-On Unix-like systems, the binary is at `target/release/norlundcalc`.
+On Unix-like systems, the binary is at `target/release/norlundcalc-cli`.
 
 ---
 
@@ -308,6 +329,8 @@ These formulas are intentionally left as future reference; the current implement
 ---
 
 ## Notes
+
+Constants, $(az+b)^p$ (Hurwitz $\zeta$, digamma at $p=-1$, Bernoulli polynomials for integer $0 \le p \le 20$), and $e^{az+b}$, $c^{az+b}$, $\sin(az+b)$, $\cos(az+b)$ (Nørlund's $e^{\beta x}$ example) are summed in closed form; only the remaining terms go through Abel–Plana, combined into one build.
 
 The Abel–Plana seed strip only needs $f$ to be analytic and of exponential type less than $2\pi/S$ on the base strip $[h, h+S]$. Global behaviour and poles are handled by recurrence. This allows the method to work for many functions that are not hypergeometric, but it is **not** a computer algebra system.
 
