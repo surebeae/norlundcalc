@@ -1,4 +1,4 @@
-use norlundcalc::{CalcError, Calculator};
+use norlundcalc::{CalcError, Calculator, Config, Engine};
 use num_complex::Complex;
 
 type C = Complex<f64>;
@@ -138,4 +138,103 @@ fn hostile_inputs_fail_cleanly() {
     let m = Calculator::sum("z^0.5", 1.0, Some(0.5), Some(1.0), false).unwrap();
     assert!(m.eval(-1e12).is_err());
     assert!(m.eval(1e12).is_ok()); // natural side: direct evaluation
+}
+
+fn config(engine: Engine) -> Config {
+    let mut c = Config::default();
+    c.engine = engine;
+    c
+}
+
+// Auto (closed forms + Abel-Plana), Plana (all Abel-Plana) and Gray (Euler-summed
+// alternating series) agree, and each solves (G(x) + G(x - S))/2 = f(x).
+// Gray is always the right branch, so h must lie right of every singularity.
+fn check_mean(expr: &str, step: f64, h: Option<f64>, f: impl Fn(C) -> C, xs: &[f64], tol: f64) {
+    check_mean_with(&[Engine::Auto, Engine::Plana, Engine::Gray], expr, step, h, f, xs, tol);
+}
+
+fn check_mean_with(engines: &[Engine], expr: &str, step: f64, h: Option<f64>, f: impl Fn(C) -> C, xs: &[f64], tol: f64) {
+    let calcs: Vec<Calculator> = engines
+        .iter()
+        .map(|&e| {
+            Calculator::mean_with_config(expr, step, h, false, &config(e)).unwrap_or_else(|err| panic!("`{expr}` {e:?}: {err}"))
+        })
+        .collect();
+    for &x in xs {
+        let vals: Vec<C> = calcs.iter().map(|calc| calc.eval(x).unwrap()).collect();
+        let rhs = f(c(x));
+        for (calc, (v, e)) in calcs.iter().zip(vals.iter().zip(engines.iter())) {
+            let lhs = 0.5 * (*v + calc.eval(x - step).unwrap());
+            assert!((lhs - rhs).norm() <= tol * rhs.norm().max(v.norm()).max(1.0), "`{expr}` {e:?} x={x}: {lhs} vs {rhs}");
+        }
+        for (v, e) in vals.iter().zip(engines.iter()).skip(1) {
+            assert!((*v - vals[0]).norm() <= tol * vals[0].norm().max(1.0), "`{expr}` x={x}: {e:?} {v} vs Auto {}", vals[0]);
+        }
+    }
+}
+
+#[test]
+fn mean_engines_agree() {
+    let xs = [1.5, 2.25, 4.75];
+    check_mean("z^2", 1.0, None, |z| z * z, &xs, 1e-10);
+    check_mean("z^3 - 2*z", 0.7, None, |z| z * z * z - c(2.0) * z, &xs, 1e-10);
+    check_mean("1/(z^2+1)", 1.0, Some(0.5), |z| c(1.0) / (z * z + c(1.0)), &[1.5, 0.2, -2.1], 1e-10);
+    check_mean("sin(2*z)", 1.0, None, |z| (c(2.0) * z).sin(), &xs, 1e-10);
+    check_mean("3*cos(z/2) + exp(-z)", 1.0, None, |z| c(3.0) * (z / 2.0).cos() + (-z).exp(), &xs, 1e-10);
+    // 2^z grows too fast for Euler summation to stay accurate (see gray::tests::growing_terms)
+    check_mean_with(&[Engine::Auto, Engine::Plana], "2^z", 1.0, None, |z| (c(2f64.ln()) * z).exp(), &xs, 1e-10);
+    check_mean("2^(z/4) + 2^(-z)", 1.0, None, |z| (c(0.25 * 2f64.ln()) * z).exp() + (c(-(2f64.ln())) * z).exp(), &xs, 1e-10);
+    assert!(Calculator::mean_with_config("2^z", 1.0, None, false, &config(Engine::Gray)).is_err());
+    assert!(Calculator::mean_with_config("sin(z*z)", 1.0, None, false, &config(Engine::Gray)).is_err());
+    check_mean("(z+0.5)^1.5", 1.0, Some(0.3), |z| (z + c(0.5)).powf(1.5), &xs, 1e-10);
+    check_mean("sqrt(z+1)", 0.7, Some(0.2), |z| (z + c(1.0)).powf(0.5), &xs, 1e-10);
+    check_mean("1/z", 0.7, Some(0.3), |z| c(1.0) / z, &[1.5, 6.1, 0.15], 1e-10);
+    check_mean("ln(z+3)", 1.0, Some(1.3), |z| (z + c(3.0)).ln(), &xs, 1e-10);
+    check_mean("z^2*exp(-z/3)", 1.0, Some(0.1), |z| z * z * (-z / 3.0).exp(), &xs, 1e-10);
+}
+
+#[test]
+fn mean_has_no_free_constant() {
+    // Strips on the same side of the poles give the same G, not G + const.
+    let a = Calculator::mean("1/(z^2+1)", 1.0, Some(0.5), false).unwrap();
+    let b = Calculator::mean("1/(z^2+1)", 1.0, Some(2.3), false).unwrap();
+    for &x in &[0.7, 1.9, 5.5, -3.2] {
+        assert!((a.eval(x).unwrap() - b.eval(x).unwrap()).norm() < 1e-12, "x={x}");
+    }
+    assert!(a.zero_point().is_nan());
+}
+
+#[test]
+fn mean_above_the_threshold() {
+    // sin(4z), S = 1: type 4 > π. Abel-Plana cannot be built; the closed form is the
+    // frequency continuation, and Euler summation (Gray) reaches the same value.
+    let auto = Calculator::mean("sin(4*z)", 1.0, None, false).unwrap();
+    let gray = Calculator::mean_with_config("sin(4*z)", 1.0, None, false, &config(Engine::Gray)).unwrap();
+    for &x in &[0.3, 2.2] {
+        let (p, q) = (auto.eval(x).unwrap(), gray.eval(x).unwrap());
+        assert!((p - q).norm() < 1e-9 * p.norm().max(1.0), "x={x}: {p} vs {q}");
+    }
+    assert!(Calculator::mean_with_config("sin(4*z)", 1.0, None, false, &config(Engine::Plana)).is_err());
+
+    // Type exactly π/S is resonant: no closed form, no Abel-Plana, no Euler limit.
+    let resonant = "sin(3.141592653589793*z)";
+    assert!(Calculator::mean(resonant, 1.0, None, false).is_err());
+    assert!(Calculator::mean_with_config(resonant, 1.0, None, false, &config(Engine::Gray)).is_err());
+}
+
+#[test]
+fn sum_engines_agree() {
+    // Closed forms against Abel-Plana for the whole expression, both normalized at a.
+    for (expr, h, a) in [("z^2 + sin(z)", None, 0.0), ("1/z", Some(0.5), 1.0), ("(z+0.5)^1.5", Some(0.3), 0.0)] {
+        let auto = Calculator::sum(expr, 1.0, h, Some(a), false).unwrap();
+        let plana = Calculator::sum_with_config(expr, 1.0, h, Some(a), false, &config(Engine::Plana)).unwrap();
+        for &x in &[1.5, 2.25, 4.75] {
+            let (p, q) = (auto.eval(x).unwrap(), plana.eval(x).unwrap());
+            assert!((p - q).norm() < 1e-9 * p.norm().max(1.0), "`{expr}` x={x}: {p} vs {q}");
+        }
+    }
+    assert!(matches!(
+        Calculator::sum_with_config("z", 1.0, None, None, false, &config(Engine::Gray)),
+        Err(CalcError::InvalidInput(_))
+    ));
 }
