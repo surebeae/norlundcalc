@@ -1,4 +1,4 @@
-use norlundcalc::{build_sum_raw_with_config, Calculator, Config, Engine};
+use norlundcalc::{build_sum_raw_detailed, Calculator, Config, Engine};
 use num_complex::Complex;
 use rayon::prelude::*;
 use std::env;
@@ -22,7 +22,8 @@ const USAGE: &str = "\
 usage: norlundcalc-cli [options]
   -f, --function EXPR   summand in z (default: sin(z*z))
       --step, --S S     step size (default: 1)
-      --h H             left edge of the seed strip [h, h+S] (default: search)
+      --h H             left edge of the seed strip [h, h+S] (default: search); if that
+                        strip is singular, the maximal strip containing Re z = H
       --a A             zero point, F(a) = 0 (default: search; 0 for --product)
       --xmin X          plot range (default: -4)
       --xmax X          (default: 19)
@@ -166,12 +167,26 @@ fn auto_find_a(eval: &(impl Fn(f64) -> Complex<f64> + Sync), xmin: f64, xmax: f6
         })
 }
 
+fn report(args: &CliArgs, seed: Option<f64>, warnings: &[String]) {
+    if args.h.is_none() {
+        if let Some(h) = seed.filter(|h| h.is_finite()) {
+            println!("Using seed strip [{h}, {}]; pass --h to choose another", h + args.step);
+        }
+    }
+    for w in warnings {
+        eprintln!("Warning: {w}");
+    }
+}
+
 // The evaluator and the lattice origin for the dots (the zero point for sums and products).
 fn build(args: &CliArgs) -> Result<(f64, Eval), String> {
     let s = args.step;
     let mut config = Config::default();
     config.engine = args.engine;
-    let wrap = |calc: Calculator| -> Eval { Box::new(move |x| calc.eval(x).unwrap_or(Complex::new(f64::NAN, f64::NAN))) };
+    let wrap = |calc: Calculator| -> Eval {
+        report(args, Some(calc.seed()), calc.warnings());
+        Box::new(move |x| calc.eval(x).unwrap_or(Complex::new(f64::NAN, f64::NAN)))
+    };
     if args.mean {
         let calc = Calculator::mean_with_config(&args.function, s, args.h, args.force, &config).map_err(|e| e.to_string())?;
         return Ok((0.0, wrap(calc)));
@@ -187,7 +202,9 @@ fn build(args: &CliArgs) -> Result<(f64, Eval), String> {
             Calculator::sum_with_config(&args.function, s, args.h, Some(a), args.force, &config).map_err(|e| e.to_string())?;
         return Ok((a, wrap(calc)));
     }
-    let raw = build_sum_raw_with_config(&args.function, s, args.h, None, args.force, &config).map_err(|e| e.to_string())?;
+    let built = build_sum_raw_detailed(&args.function, s, args.h, None, args.force, &config).map_err(|e| e.to_string())?;
+    report(args, built.seed, &built.warnings);
+    let raw = built.eval;
     let a = auto_find_a(&raw, args.xmin, args.xmax).ok_or("no finite zero point found near the plot range; pass --a")?;
     println!("Using zero point a = {a}");
     let offset = raw(a);

@@ -33,6 +33,7 @@ pub struct Calculator {
     zero_point: f64,
     seed: f64,
     domain: (f64, f64),
+    warnings: Vec<String>,
 }
 
 impl Calculator {
@@ -67,6 +68,7 @@ impl Calculator {
             zero_point: f64::NAN,
             seed: built.h,
             domain: built.domain,
+            warnings: built.notes,
         })
     }
 
@@ -84,7 +86,14 @@ impl Calculator {
             CalcError::BuildFailed(m) => CalcError::BuildFailed(format!("could not build indefinite sum: {m}")),
             other => other,
         })?;
-        Ok(Calculator { evaluator: built.eval, kind: SumKind::Sum, zero_point, seed: built.h, domain: built.domain })
+        Ok(Calculator {
+            evaluator: built.eval,
+            kind: SumKind::Sum,
+            zero_point,
+            seed: built.h,
+            domain: built.domain,
+            warnings: built.notes,
+        })
     }
 
     pub fn product_with_config(
@@ -109,6 +118,7 @@ impl Calculator {
             zero_point,
             seed: built.h,
             domain: built.domain,
+            warnings: built.notes,
         })
     }
 
@@ -141,9 +151,14 @@ impl Calculator {
         self.kind
     }
 
-    // Left edge h of the seed strip [h, h + S] that was used (NaN for the gray engine).
+    // Left edge h of the seed strip [h, h + S]: the user's h when given, else the searched one.
+    // NaN for the gray engine and when only closed forms were needed.
     pub fn seed(&self) -> f64 {
         self.seed
+    }
+
+    pub fn warnings(&self) -> &[String] {
+        &self.warnings
     }
 
     // Range of x that eval accepts.
@@ -170,11 +185,30 @@ pub fn build_sum_raw_with_config(
     force: bool,
     config: &Config,
 ) -> Result<Box<dyn Fn(f64) -> Complex<f64> + Send + Sync>, CalcError> {
+    build_sum_raw_detailed(expr, step, h, a, force, config).map(|r| r.eval)
+}
+
+// seed: None if only closed forms were needed
+pub struct RawSum {
+    pub eval: Box<dyn Fn(f64) -> Complex<f64> + Send + Sync>,
+    pub seed: Option<f64>,
+    pub warnings: Vec<String>,
+}
+
+pub fn build_sum_raw_detailed(
+    expr: &str,
+    step: f64,
+    h: Option<f64>,
+    a: Option<f64>,
+    force: bool,
+    config: &Config,
+) -> Result<RawSum, CalcError> {
     validate_params(step, h, a)?;
-    crate::term::build_sum(expr, step, h, a, config, force).map(|b| b.eval).map_err(|e| match e {
+    let built = crate::term::build_sum(expr, step, h, a, config, force).map_err(|e| match e {
         CalcError::BuildFailed(m) => CalcError::BuildFailed(format!("could not build indefinite sum: {m}")),
         other => other,
-    })
+    })?;
+    Ok(RawSum { eval: built.eval, seed: built.h.is_finite().then_some(built.h), warnings: built.notes })
 }
 
 #[cfg(test)]

@@ -9,10 +9,11 @@ pub mod limits;
 mod mono;
 mod quadrature;
 mod term;
+mod thin;
 mod util;
 mod validation;
 
-pub use calc::{build_sum_raw, build_sum_raw_with_config, Calculator, SumKind};
+pub use calc::{build_sum_raw, build_sum_raw_detailed, build_sum_raw_with_config, Calculator, RawSum, SumKind};
 pub use error::CalcError;
 pub use validation::{Config, Engine};
 
@@ -110,6 +111,11 @@ mod python {
         #[getter]
         fn seed(&self) -> f64 {
             self.inner.seed()
+        }
+
+        #[getter]
+        fn warnings(&self) -> Vec<String> {
+            self.inner.warnings().to_vec()
         }
 
         // (lo, hi): the range of x that evaluation accepts.

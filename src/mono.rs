@@ -1,6 +1,6 @@
 use crate::util::{KahanSum, NAN};
 use num_complex::Complex;
-use std::f64::consts::PI;
+use std::f64::consts::{PI, TAU};
 
 pub(crate) use std::f64::consts::EULER_GAMMA as EULER_MASCHERONI;
 
@@ -112,7 +112,7 @@ fn ln_gamma(x: f64) -> f64 {
         series += b / ((2 * k) as f64 * (2 * k - 1) as f64) * pw;
         pw *= inv_x2;
     }
-    (x - 0.5) * x.ln() - x + 0.5 * (2.0 * PI).ln() + series - shift
+    (x - 0.5) * x.ln() - x + 0.5 * TAU.ln() + series - shift
 }
 
 // ln|Γ(x)| and whether Γ(x) < 0, for real x off the poles 0, -1, -2, ...
@@ -175,14 +175,14 @@ impl LogAffineSum {
 // (no cancellation, unlike Euler-Maclaurin).
 fn hurwitz_fourier(p: f64, a: f64) -> f64 {
     let q = p + 1.0;
-    let log_prefactor = 2f64.ln() + ln_gamma(q) - q * (2.0 * PI).ln();
+    let log_prefactor = 2f64.ln() + ln_gamma(q) - q * TAU.ln();
     // n^{-q} < 1e-17 beyond this
     let n_max = 10f64.powf(17.0 / q).ceil().min(100_000.0) as usize;
     let phase = 0.5 * PI * (q % 4.0);
     let mut acc = 0.0;
     for n in (1..=n_max).rev() {
         let frac = (n as f64 * a).fract();
-        acc += (2.0 * PI * frac - phase).cos() / (n as f64).powf(q);
+        acc += (TAU * frac - phase).cos() / (n as f64).powf(q);
     }
     log_prefactor.exp() * acc
 }

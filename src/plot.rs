@@ -123,6 +123,8 @@ pub(crate) fn clip_segment(
     p1: (f64, f64),
     (x0, y0, x1, y1): (f64, f64, f64, f64),
 ) -> Option<((f64, f64), (f64, f64))> {
+    // Both ends past one edge. With |y| far beyond the box, t0 and t1 below can round to the
+    // same value, and such a segment would otherwise pass.
     if (p0.0 < x0 && p1.0 < x0) || (p0.0 > x1 && p1.0 > x1) || (p0.1 < y0 && p1.1 < y0) || (p0.1 > y1 && p1.1 > y1) {
         return None;
     }
@@ -146,13 +148,17 @@ pub(crate) fn clip_segment(
             }
         }
     }
-    // Unclipped ends are returned exactly, so segments chain by equality.
+    // Unclipped ends are returned exactly, so segments chain by equality. Clipped ends are
+    // clamped into the box: p0 + t·d cancels when |p0| is huge.
     let inside = |p: (f64, f64)| (p.0.clamp(x0, x1), p.1.clamp(y0, y1));
     let start = if t0 == 0.0 { p0 } else { inside((p0.0 + t0 * dx, p0.1 + t0 * dy)) };
     let end = if t1 == 1.0 { p1 } else { inside((p0.0 + t1 * dx, p0.1 + t1 * dy)) };
     Some((start, end))
 }
 
+// Pixel coordinates are clamped to this distance outside the frame. A line from a visible
+// point to a clamped one leaves the frame within ~1e-5 px of the exact line, and clipping
+// stays exact; values like 1e260 near an essential singularity broke it.
 const FAR_PX: f64 = 1e9;
 
 // Data -> pixel mapping for the plot rectangle.
@@ -166,6 +172,7 @@ struct Frame {
 }
 
 impl Frame {
+    // NaN passes through and breaks the line; overflow to + / - inf is clamped like any far value.
     fn px(&self, x: f64) -> f64 {
         let v = self.left + (x - self.x.0) / (self.x.1 - self.x.0) * self.width;
         v.clamp(self.left - FAR_PX, self.left + self.width + FAR_PX)
@@ -488,21 +495,26 @@ mod tests {
         let (a, b) = clip_segment((5.0, 5.0), (6.0, -1e12), r).unwrap();
         assert_eq!(a, (5.0, 5.0));
         assert!((b.1 - 0.0).abs() < 1e-9 && (b.0 - (5.0 + 5.0 / (1e12 + 5.0))).abs() < 1e-9);
+        // wholly above the box, |y| beyond the resolution of t: rejected (t0 = t1 = 1 once let
+        // it through with the unclipped end at -6e40, -inf as f32)
         assert_eq!(clip_segment((5.0, -2.4e262), (5.1, -3.3e40), r), None);
+        // wholly below: once drawn from y = 0 to y = 7e24, across the whole box
         assert_eq!(clip_segment((5.0, 1.3e47), (5.1, 3.7e24), r), None);
+        // any clipped end lies in the box
         let (a, b) = clip_segment((5.0, -1e300), (6.0, 1e300), r).unwrap();
         for p in [a, b] {
             assert!((0.0..=10.0).contains(&p.0) && (0.0..=10.0).contains(&p.1), "{p:?}");
         }
     }
 
-    // e^{1/(z-1)}
+    // e^{1/(z-1)} has values like 1e260 next to the visible curve (issue #1). Before the fix the
+    // whole line vanished: one segment reached tiny-skia with a -inf coordinate.
     #[test]
     fn line_survives_huge_values() {
         let mut pts: Vec<(f64, f64)> = (0..=100).map(|i| (i as f64 * 0.1, 0.0)).collect();
-        pts[50].1 = 2.9e260; 
+        pts[50].1 = 2.9e260; // with pts[51] a segment wholly above the frame
         pts[51].1 = 3.9e38;
-        pts[70].1 = -1e307;
+        pts[70].1 = -1e307; // py overflows to +inf; the drop to it should still be drawn
         let red = Rgb::hex(0xEC9E9E);
         let fig = Figure {
             title: "",
@@ -519,9 +531,12 @@ mod tests {
             let px = &img.rgba[i..i + 3];
             px.iter().zip([red.0, red.1, red.2]).all(|(&a, b)| a.abs_diff(b) <= 3)
         };
+        // scale 1: frame left 200, top 110, 2130 x 1340, so y = 0 is at row 780
         let col = |x: f64| (MARGIN_LEFT as f64 + x / 10.0 * (LOGICAL_W - MARGIN_LEFT - MARGIN_RIGHT) as f64) as usize;
+        // the flat part, away from the spikes (rows 779 and 780 are both fully covered)
         assert!(is_red(col(2.5), 780), "line at x = 2.5 missing");
         assert!(is_red(col(8.5), 779), "line at x = 8.5 missing");
+        // the near-vertical drop at x = 6.9 toward -1e307, low in the frame
         assert!(is_red(col(6.9), 1200), "drop at x = 6.9 missing");
     }
 }

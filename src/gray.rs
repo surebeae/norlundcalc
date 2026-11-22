@@ -2,8 +2,8 @@ use crate::util::{is_finite, KahanSum, NAN};
 use num_complex::Complex;
 
 // Mean inverse 2 Σ_{k≥1} (-1)^{k-1} f(x + kS) (right branch) by Euler's method (E,1) on the
-// partial sums: Gray (1966) with λ = -1 and T the shift. Error ~ sin(τS/2)^n for type τ, so
-// it converges for τ < π/S and for isolated frequencies past it. NaN if t_n, t_2n never agree.
+// partial sums: Gray (1966) with λ = -1 and T the shift. Error ~ sin(σS/2)^n for type σ, so
+// it converges for σ < π/S and for isolated frequencies past it. NaN if t_n, t_2n never agree.
 pub(crate) fn mean_inverse<F: Fn(Complex<f64>) -> Complex<f64>>(
     f: &F,
     x: f64,

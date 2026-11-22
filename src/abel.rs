@@ -4,7 +4,7 @@ use crate::util::{is_finite, KahanSum, Op, NAN};
 use crate::validation::Config;
 use num_complex::Complex;
 use rayon::prelude::*;
-use std::f64::consts::PI;
+use std::f64::consts::{PI, TAU};
 
 const I: Complex<f64> = Complex::new(0.0, 1.0);
 
@@ -18,12 +18,33 @@ pub(crate) enum Mode {
 // new + τik with k chosen so the imaginary part is within π of prev.
 #[inline]
 fn unwrap_log(prev: Complex<f64>, new: Complex<f64>) -> Complex<f64> {
-    let k = ((prev.im - new.im) / (2.0 * PI)).round();
-    Complex::new(new.re, new.im + 2.0 * PI * k)
+    let k = ((prev.im - new.im) / TAU).round();
+    Complex::new(new.re, new.im + TAU * k)
+}
+
+/// Abel–Plana tail diagnosis, from harmless to fatal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Resonance {
+    None,
+    /// Integrand ~ C/t: a continuous spectrum across the threshold, e.g. sin(τx)/(πx) with
+    /// S = 1. Solutions of that type differ by threshold tones; the finite part is used.
+    Spread,
+    /// Integrand flat or polynomial: a tone at the threshold. Only secular solutions exist.
+    Tone,
+    /// Integrand grows exponentially: type above the threshold.
+    Exponential,
+}
+
+// err: 0 if the panels converged, else the disagreement of two finite-part fits.
+#[derive(Clone, Copy, Debug)]
+struct Tail {
+    value: Complex<f64>,
+    ok: bool,
+    kind: Resonance,
+    err: f64,
 }
 
 // Sum: -1/2 u(w) - i·Tail(w), the base without ∫_0^w u.  Mean: u(w) - i·Tail(w) = G.
-// Also whether the tail converged.
 fn base_without_integral<G: Fn(Complex<f64>) -> Complex<f64>>(
     u: &G,
     op: Op,
@@ -31,18 +52,33 @@ fn base_without_integral<G: Fn(Complex<f64>) -> Complex<f64>>(
     w: f64,
     rule: &GaussRule,
     config: &Config,
-) -> (Complex<f64>, bool) {
+) -> (Complex<f64>, Tail) {
     let uw = u(Complex::new(w, 0.0));
-    let (tail, ok) = tail_integral(u, op, mode, w, uw, rule, config);
+    let mut tail = tail_integral(u, op, mode, w, uw, rule, config);
     let own = match op {
         Op::Sum => -0.5 * uw,
         Op::Mean => uw,
     };
-    (own - I * tail, ok && is_finite(uw))
+    tail.ok &= is_finite(uw);
+    (own - I * tail.value, tail)
+}
+
+#[inline]
+fn kernel(op: Op, t: f64) -> f64 {
+    match op {
+        Op::Sum => (TAU * t).exp_m1(),
+        Op::Mean => (PI * t).sinh(),
+    }
+}
+
+#[inline]
+fn plain_integrand<G: Fn(Complex<f64>) -> Complex<f64>>(u: &G, op: Op, w: f64, t: f64) -> Complex<f64> {
+    (u(Complex::new(w, t)) - u(Complex::new(w, -t))) / kernel(op, t)
 }
 
 // ∫_0^∞ [u(w+it) - u(w-it)] k(t) dt, k = 1/(e^{τt} - 1) (sum) or 1/sinh(πt) (mean).
-// Nodes ascend in t, which unwrapping needs.
+// Nodes ascend in t, which unwrapping needs. Unsettled at the cap (Mode::Plain): diagnosed, and
+// replaced by its finite part if it decays.
 fn tail_integral<G: Fn(Complex<f64>) -> Complex<f64>>(
     u: &G,
     op: Op,
@@ -51,7 +87,7 @@ fn tail_integral<G: Fn(Complex<f64>) -> Complex<f64>>(
     uw: Complex<f64>,
     rule: &GaussRule,
     config: &Config,
-) -> (Complex<f64>, bool) {
+) -> Tail {
     let (mut prev_up, mut prev_dn) = (uw, uw);
     let mut integrand = |t: f64| -> Complex<f64> {
         let mut up = u(Complex::new(w, t));
@@ -62,11 +98,7 @@ fn tail_integral<G: Fn(Complex<f64>) -> Complex<f64>>(
             prev_up = up;
             prev_dn = dn;
         }
-        let denom = match op {
-            Op::Sum => (2.0 * PI * t).exp_m1(),
-            Op::Mean => (PI * t).sinh(),
-        };
-        (up - dn) / denom
+        (up - dn) / kernel(op, t)
     };
 
     let mut total = KahanSum::default();
@@ -74,6 +106,8 @@ fn tail_integral<G: Fn(Complex<f64>) -> Complex<f64>>(
     let mut quiet_panels = 0;
     let mut t = 0.0;
     let cap = config.tail_y_cap.max(1.0);
+    // ∫_0^{y_b}, y_b the first panel end ≥ 3/4 cap
+    let mut checkpoint: Option<(f64, Complex<f64>)> = None;
 
     while t < cap {
         // Narrower panels near 0.
@@ -81,22 +115,174 @@ fn tail_integral<G: Fn(Complex<f64>) -> Complex<f64>>(
         let next = (t + width).min(cap);
         let panel = rule.integrate(t, next, &mut integrand);
         if !is_finite(panel) {
-            return (NAN, false);
+            // overflow far up the line, a singularity near the axis
+            let kind = if t > 2.0 { Resonance::Exponential } else { Resonance::None };
+            return Tail { value: NAN, ok: false, kind, err: f64::INFINITY };
         }
         total.add(panel);
         envelope = envelope.max(total.total().norm());
         t = next;
+        if checkpoint.is_none() && t >= 0.75 * cap {
+            checkpoint = Some((t, total.total()));
+        }
 
         if t >= 2.0 && panel.norm() <= config.tail_rel_tol * envelope.max(f64::MIN_POSITIVE) {
             quiet_panels += 1;
             if quiet_panels >= 2 {
-                return (total.total(), true);
+                return Tail { value: total.total(), ok: true, kind: Resonance::None, err: 0.0 };
             }
         } else {
             quiet_panels = 0;
         }
     }
-    (total.total(), false)
+    if mode == Mode::Log {
+        return Tail { value: total.total(), ok: false, kind: Resonance::None, err: f64::INFINITY };
+    }
+    let checkpoint = checkpoint.unwrap_or((t, total.total()));
+    diagnose_tail(u, op, w, t, total.total(), checkpoint, envelope, config)
+}
+
+// Finite parts fitted at y and y_b ≈ 3y/4 that agree are used. Otherwise, from |g| at y/4, y/2, y:
+// flat or polynomial is a tone, accelerating growth exponential type, slow decay a spread this
+// seed cannot resolve.
+#[allow(clippy::too_many_arguments)]
+fn diagnose_tail<G: Fn(Complex<f64>) -> Complex<f64>>(
+    u: &G,
+    op: Op,
+    w: f64,
+    y: f64,
+    total_y: Complex<f64>,
+    (y_b, total_b): (f64, Complex<f64>),
+    envelope: f64,
+    config: &Config,
+) -> Tail {
+    let g = |t: f64| plain_integrand(u, op, w, t);
+    let scale = envelope.max(1.0);
+    // windowed so zeros of an oscillating factor do not mislead; p is the power of t on [y/2, y]
+    let mag = |t: f64| [0.97, 1.0, 1.03].iter().map(|k| g(k * t).norm()).sum::<f64>() / 3.0;
+    let (m1, m2, m3) = (mag(0.25 * y), mag(0.5 * y), mag(y));
+    if !(m1.is_finite() && m2.is_finite() && m3.is_finite()) {
+        return Tail { value: total_y, ok: false, kind: Resonance::Exponential, err: f64::INFINITY };
+    }
+    let lg = |m: f64| m.max(1e-300).ln();
+    let (r1, r2) = (lg(m2) - lg(m1), lg(m3) - lg(m2));
+    let p = r2 / std::f64::consts::LN_2;
+    // at |Re z| comparable to the cap a spread still decays like 1/|x + it|
+    let flat = p > -0.1;
+
+    let mut err = f64::INFINITY;
+    // short window: faster in 1/t (seeds far from 0); long: less rounding noise (near-threshold)
+    let pair = |sigma_max: f64| match (finite_part(&g, total_y, y, sigma_max), finite_part(&g, total_b, y_b, sigma_max)) {
+        (Some(a), Some(b)) => Some(((a.value - b.value).norm(), a)),
+        _ => None,
+    };
+    let best = [2.0, 3.0].iter().filter_map(|&m| pair(m)).min_by(|p, q| p.0.total_cmp(&q.0));
+    if let Some((e, a)) = best {
+        err = e;
+        let tone = flat && a.c_lin.norm() * y > 1e-3 * a.size;
+        if err <= config.tail_fp_tol * scale && !tone {
+            let spread = a.c0.norm() > 1e-6 * a.size && a.c0.norm() > config.tail_fp_tol * scale;
+            let kind = if spread { Resonance::Spread } else { Resonance::None };
+            return Tail { value: a.value, ok: true, kind, err };
+        }
+        if tone {
+            return Tail { value: total_y, ok: false, kind: Resonance::Tone, err };
+        }
+    }
+    let kind = if flat {
+        if r2 > 0.2 && r2 > 1.5 * r1 + 0.2 { Resonance::Exponential } else { Resonance::Tone }
+    } else if r2 < 1.5 * r1 - 0.2 || p <= -1.3 {
+        Resonance::None // decays, but not within the cap
+    } else {
+        Resonance::Spread
+    };
+    Tail { value: total_y, ok: false, kind, err }
+}
+
+// A tone or exponential type shows at every point. Mixed readings are interference at |Re z|
+// comparable to the cap: an unresolved spread.
+fn aggregate_resonance<'a>(tails: impl Iterator<Item = &'a Tail>) -> Resonance {
+    let (mut worst_ok, mut fatal, mut other) = (Resonance::None, None::<Resonance>, None::<Resonance>);
+    for t in tails {
+        if t.ok {
+            worst_ok = worst_ok.max(t.kind);
+        } else if matches!(t.kind, Resonance::Tone | Resonance::Exponential) {
+            fatal = Some(fatal.map_or(t.kind, |k| k.min(t.kind)));
+        } else {
+            other = Some(other.map_or(t.kind, |k| k.max(t.kind)));
+        }
+    }
+    match (fatal, other) {
+        (Some(_), Some(_)) => Resonance::Spread,
+        (Some(k), None) => k,
+        (None, Some(k)) => worst_ok.max(k),
+        (None, None) => worst_ok,
+    }
+}
+
+struct FinitePart {
+    value: Complex<f64>,
+    // coefficients of 1 and 1/t in g; size = max |t·g| on the fit interval
+    c_lin: Complex<f64>,
+    c0: Complex<f64>,
+    size: f64,
+}
+
+// With t·g(t) ≈ c_lin·t + Σ_{0<=k<K-1} c_k t^{-k} on [y/sigma_max, y],
+// FP = ∫_0^y g - c_lin·y - c_0 ln y + Σ_{k≥1} c_k y^{-k}/k. c_lin absorbs e^{-εt} from a spectrum
+// edge just inside the threshold (6.2831853 for τ).
+fn finite_part<G: Fn(f64) -> Complex<f64>>(g: &G, total: Complex<f64>, y: f64, sigma_max: f64) -> Option<FinitePart> {
+    const K: usize = 9;
+    let zero = Complex::new(0.0, 0.0);
+    let mut a = [[zero; K]; K];
+    let mut b = [zero; K];
+    for j in 0..K {
+        // σ = y/t; unknowns e = c_lin·y (basis 1/σ), d_k = c_k y^{-k} (basis σ^k)
+        let (mid, half) = (0.5 * (sigma_max + 1.0), 0.5 * (sigma_max - 1.0));
+        let sigma = mid + half * (PI * (j as f64 + 0.5) / K as f64).cos();
+        let t = y / sigma;
+        b[j] = g(t) * t;
+        a[j][0] = Complex::new(1.0 / sigma, 0.0);
+        for k in 0..K - 1 {
+            a[j][k + 1] = Complex::new(sigma.powi(k as i32), 0.0);
+        }
+    }
+    let size = b.iter().map(|v| v.norm()).fold(0.0, f64::max);
+    let x = solve(a, b)?;
+    let (e, d) = (x[0], &x[1..]);
+    let mut value = total - e - d[0] * y.ln();
+    for (k, dk) in d.iter().enumerate().skip(1) {
+        value += *dk / k as f64;
+    }
+    (is_finite(value) && size.is_finite()).then_some(FinitePart { value, c_lin: e / y, c0: d[0], size })
+}
+
+fn solve<const K: usize>(mut a: [[Complex<f64>; K]; K], mut b: [Complex<f64>; K]) -> Option<[Complex<f64>; K]> {
+    for i in 0..K {
+        let piv = (i..K).max_by(|&p, &q| a[p][i].norm().total_cmp(&a[q][i].norm()))?;
+        if a[piv][i].norm() == 0.0 {
+            return None;
+        }
+        a.swap(i, piv);
+        b.swap(i, piv);
+        let (pivot_row, pivot_b) = (a[i], b[i]);
+        for (row, br) in a.iter_mut().zip(b.iter_mut()).skip(i + 1) {
+            let q = row[i] / pivot_row[i];
+            for (x, p) in row.iter_mut().zip(pivot_row.iter()).skip(i) {
+                *x -= q * *p;
+            }
+            *br -= q * pivot_b;
+        }
+    }
+    let mut x = b;
+    for i in (0..K).rev() {
+        let mut v = x[i];
+        for c in i + 1..K {
+            v -= a[i][c] * x[c];
+        }
+        x[i] = v / a[i][i];
+    }
+    Some(x)
 }
 
 pub struct AbelPlanaSum<F: Fn(Complex<f64>) -> Complex<f64> + Sync> {
@@ -108,6 +294,9 @@ pub struct AbelPlanaSum<F: Fn(Complex<f64>) -> Complex<f64> + Sync> {
     c: Complex<f64>,
     max_recurrence: u64,
     converged: bool,
+    resonance: Resonance,
+    tail_error: f64,
+    tails_ok: bool,
 }
 
 impl<F: Fn(Complex<f64>) -> Complex<f64> + Sync> AbelPlanaSum<F> {
@@ -128,7 +317,7 @@ impl<F: Fn(Complex<f64>) -> Complex<f64> + Sync> AbelPlanaSum<F> {
 
         // Base values minus ∫_0^w u, on the Lobatto grid.
         let mut n = n_min;
-        let mut partial: Vec<(Complex<f64>, bool)> = (0..=n)
+        let mut partial: Vec<(Complex<f64>, Tail)> = (0..=n)
             .into_par_iter()
             .map(|j| base_without_integral(&u, op, mode, lobatto_point(n, j, 0.0, 1.0), &rule, config))
             .collect();
@@ -150,9 +339,12 @@ impl<F: Fn(Complex<f64>) -> Complex<f64> + Sync> AbelPlanaSum<F> {
             }
 
             let mut cheb = Chebyshev::from_lobatto_values(0.0, 1.0, &values);
-            let ok = cheb.tail_ratio() <= config.cheb_tol;
+            // a finite-part tail is only good to its error estimate
+            let size = values.iter().map(|v| v.norm()).fold(1.0, f64::max);
+            let tail_floor = partial.iter().filter(|(_, t)| t.ok).map(|(_, t)| t.err).fold(0.0, f64::max) / size;
+            let ok = cheb.tail_ratio() <= config.cheb_tol.max(10.0 * tail_floor);
             // refining cannot fix a tail integral that did not converge
-            let tails_ok = partial.iter().all(|&(_, t)| t);
+            let tails_ok = partial.iter().all(|(_, t)| t.ok);
             if ok || 2 * n > n_max || !tails_ok {
                 cheb.chop(0.01 * config.cheb_tol);
                 break (cheb, ok);
@@ -160,7 +352,7 @@ impl<F: Fn(Complex<f64>) -> Complex<f64> + Sync> AbelPlanaSum<F> {
 
             // The n grid is the even points of the 2n grid.
             let n2 = 2 * n;
-            let fresh: Vec<(Complex<f64>, bool)> = (0..n)
+            let fresh: Vec<(Complex<f64>, Tail)> = (0..n)
                 .into_par_iter()
                 .map(|k| base_without_integral(&u, op, mode, lobatto_point(n2, 2 * k + 1, 0.0, 1.0), &rule, config))
                 .collect();
@@ -174,7 +366,9 @@ impl<F: Fn(Complex<f64>) -> Complex<f64> + Sync> AbelPlanaSum<F> {
             n = n2;
         };
 
-        let tail_ok = partial.iter().all(|&(_, ok)| ok);
+        let tail_ok = partial.iter().all(|(_, t)| t.ok);
+        let resonance = aggregate_resonance(partial.iter().map(|(_, t)| t));
+        let tail_error = partial.iter().map(|(_, t)| t.err).fold(0.0, f64::max);
         let max_recurrence = config.max_recurrence;
         let c = match op {
             Op::Sum => raw_eval(&f, op, h, s, &base, max_recurrence, h)
@@ -185,7 +379,19 @@ impl<F: Fn(Complex<f64>) -> Complex<f64> + Sync> AbelPlanaSum<F> {
             return Err("normalization constant is non-finite".to_string());
         }
 
-        Ok(AbelPlanaSum { f, op, h, s, base, c, max_recurrence, converged: cheb_ok && tail_ok })
+        Ok(AbelPlanaSum {
+            f,
+            op,
+            h,
+            s,
+            base,
+            c,
+            max_recurrence,
+            converged: cheb_ok && tail_ok,
+            resonance,
+            tail_error,
+            tails_ok: tail_ok,
+        })
     }
 
     // Sum: F(x) - F(h).  Mean: G(x).  NaN at a singularity or past max_recurrence steps.
@@ -216,6 +422,19 @@ impl<F: Fn(Complex<f64>) -> Complex<f64> + Sync> AbelPlanaSum<F> {
     // Whether both the Chebyshev series and every tail integral converged.
     pub fn converged(&self) -> bool {
         self.converged
+    }
+
+    pub fn resonance(&self) -> Resonance {
+        self.resonance
+    }
+
+    pub fn tails_ok(&self) -> bool {
+        self.tails_ok
+    }
+
+    // 0 if every tail converged, inf if one failed
+    pub fn tail_error(&self) -> f64 {
+        self.tail_error
     }
 
     // Degree of the Chebyshev base interpolant (diagnostic).
@@ -353,7 +572,7 @@ mod tests {
                 acc -= x.ln();
                 x += 1.0;
             }
-            acc + (x - 0.5) * x.ln() - x + 0.5 * (2.0 * PI).ln() + 1.0 / (12.0 * x) - 1.0 / (360.0 * x.powi(3))
+            acc + (x - 0.5) * x.ln() - x + 0.5 * TAU.ln() + 1.0 / (12.0 * x) - 1.0 / (360.0 * x.powi(3))
                 + 1.0 / (1260.0 * x.powi(5))
         };
         for &x in &[1.5, 2.25, 3.9, 7.1] {
@@ -477,5 +696,72 @@ mod tests {
         let op = AbelPlanaSum::new(f, 0.0, 1.0, &Config::default()).unwrap();
         assert!(op.converged());
         assert!(op.base_degree() <= 64, "degree {}", op.base_degree());
+    }
+
+    fn sinc(z: Complex<f64>) -> Complex<f64> {
+        (z * TAU).sin() / (z * PI)
+    }
+
+    #[test]
+    fn spread_resonance_uses_the_finite_part() {
+        // the truncated tail grows like ln(cap); its finite part depends on neither cap nor seed
+        let mk = |h: f64, cap: f64| {
+            let cfg = Config { tail_y_cap: cap, ..Config::default() };
+            AbelPlanaSum::build(sinc, Op::Sum, Mode::Plain, h, 1.0, &cfg).unwrap()
+        };
+        let base = mk(0.1, 60.0);
+        assert!(base.converged() && base.resonance() == Resonance::Spread, "{:?}", base.resonance());
+        let xs: Vec<f64> = (0..30).map(|i| -3.0 + 0.231 * i as f64).collect();
+        for x in &xs {
+            let r = base.apply(*x) - sinc(c(*x));
+            assert!(r.norm() < 1e-12, "residual at {x}: {r}");
+        }
+        for (h, cap) in [(0.1, 40.0), (0.6, 60.0), (-1.7, 50.0), (1.2, 60.0)] {
+            let other = mk(h, cap);
+            assert!(other.converged(), "h={h} cap={cap}");
+            let d0 = other.eval_raw(0.5) - base.eval_raw(0.5);
+            for x in &xs {
+                let d = other.eval_raw(*x) - base.eval_raw(*x) - d0;
+                assert!(d.norm() < 1e-8, "h={h} cap={cap} x={x}: {d}");
+            }
+        }
+    }
+
+    #[test]
+    fn spread_resonance_of_the_mean_has_no_constant() {
+        let f = |z: Complex<f64>| (z * PI).sin() / (z * PI);
+        let a = mean_op(f, 0.1, 1.0);
+        let b = mean_op(f, 0.35, 1.0);
+        assert_eq!(a.resonance(), Resonance::Spread);
+        for &x in &[-2.0, -0.3, 0.8, 2.6, 5.1] {
+            assert!((a.apply(x) - f(c(x))).norm() < 1e-12, "x={x}");
+            assert!((a.eval_raw(x) - b.eval_raw(x)).norm() < 1e-8, "x={x}");
+        }
+    }
+
+    #[test]
+    #[allow(clippy::approx_constant)] // the truncated constants are the point of the test
+    fn near_resonant_constants_are_a_spread() {
+        // 6.2831853 = τ - 7.2e-9: the integrand is e^{-εt}·C/t, and a·t, τt differ in rounding
+        let f = |z: Complex<f64>| (z * 6.2831853).sin() / (z * 3.141592);
+        let ops: Vec<_> = [1.0, 0.1, -1.3]
+            .iter()
+            .map(|&h| AbelPlanaSum::build(f, Op::Sum, Mode::Plain, h, 1.0, &Config::default()).unwrap())
+            .collect();
+        for op in &ops {
+            assert!(op.converged() && op.resonance() == Resonance::Spread, "{:?} {:.1e}", op.resonance(), op.tail_error());
+        }
+        let d0 = ops[1].eval_raw(0.5) - ops[0].eval_raw(0.5);
+        for &x in &[-2.3, 0.7, 2.6] {
+            assert!((ops[1].eval_raw(x) - ops[0].eval_raw(x) - d0).norm() < 1e-6, "x={x}");
+        }
+    }
+
+    #[test]
+    fn pure_tone_is_diagnosed() {
+        let f = |z: Complex<f64>| (Complex::new(0.0, TAU) * z).exp() + c(1.0) / (z * z + c(1.0));
+        let op = AbelPlanaSum::new(f, 1.3, 1.0, &Config::default()).unwrap();
+        assert!(!op.converged());
+        assert_eq!(op.resonance(), Resonance::Tone);
     }
 }

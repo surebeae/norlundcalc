@@ -1,8 +1,8 @@
-use crate::abel::{AbelPlanaSum, Mode};
+use crate::abel::{AbelPlanaSum, Mode, Resonance};
 use crate::util::{is_finite, Op};
 use num_complex::Complex;
 use rayon::prelude::*;
-use std::f64::consts::PI;
+use std::f64::consts::{PI, TAU};
 
 // How terms are evaluated.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -28,6 +28,8 @@ pub struct Config {
     pub tail_y_cap: f64,
     // Tail panels below this fraction of the running total are negligible.
     pub tail_rel_tol: f64,
+    // Required agreement of the finite-part fits at the cap and 3/4 of it, relative to the tail.
+    pub tail_fp_tol: f64,
     // Initial and maximal degree of the Chebyshev base interpolant.
     pub cheb_min_degree: usize,
     pub cheb_max_degree: usize,
@@ -52,6 +54,7 @@ impl Default for Config {
             gl_order: 16,
             tail_y_cap: 60.0,
             tail_rel_tol: 1e-17,
+            tail_fp_tol: 1e-7,
             cheb_min_degree: 32,
             cheb_max_degree: 512,
             cheb_tol: 1e-13,
@@ -104,7 +107,9 @@ fn strip_has_singularity<F: Fn(CF) -> CF + Sync>(f: &F, h: f64, s: f64, verbose:
     })
 }
 
+// Scaled by e^{τ|y|/S} so admissible growth is not taken for a pole.
 fn strip_has_pole_near_axis<F: Fn(CF) -> CF + Sync>(f: &F, h: f64, s: f64, verbose: bool) -> bool {
+    let rate = TAU / s;
     // 40 x-points so a pole at a "nice" x inside the strip is sampled, e.g.
     // z = i for 1/(z^2+1) with h = -1.4, S = 4, where x = 0.
     let n_x = 40;
@@ -114,7 +119,7 @@ fn strip_has_pole_near_axis<F: Fn(CF) -> CF + Sync>(f: &F, h: f64, s: f64, verbo
         (0..=n_y).any(|j| {
             let y = -6.0 + 12.0 * j as f64 / n_y as f64;
             let val = f(Complex::new(x, y));
-            let hit = bad(val) || val.norm() > 1e10;
+            let hit = bad(val) || val.norm() > 1e10 * (rate * y.abs()).exp();
             if hit && verbose {
                 eprintln!("        [pole detected] at ({x:.6},{y:.6})");
             }
@@ -152,38 +157,49 @@ fn strip_is_safe<F: Fn(CF) -> CF + Sync>(f: &F, h: f64, s: f64, config: &Config,
     !rough
 }
 
-// Exponential type below 2π/S (sum, measured on f(z+S) - f(z)) or π/S (mean, on f).
-fn validate_decay<F: Fn(CF) -> CF + Sync>(f: &F, op: Op, h: f64, s: f64, config: &Config, verbose: bool) -> bool {
+// Exponential type not above τ/S (sum, measured on f(z+S) - f(z)) or π/S (mean, on f), in both
+// half-planes.
+fn validate_decay<F: Fn(CF) -> CF + Sync>(
+    f: &F,
+    op: Op,
+    h: f64,
+    s: f64,
+    config: &Config,
+    verbose: bool,
+) -> Result<(), (f64, f64)> {
     let limit = match op {
-        Op::Sum => 2.0 * PI / s,
+        Op::Sum => TAU / s,
         Op::Mean => PI / s,
     };
     let n_x = 5;
     let y_min = config.contour_half_height.max(5.0);
     let y_max = config.decay_ymax.max(y_min);
     let n = config.decay_n_points.max(2);
-    for i in 0..=n_x {
-        let x = h + s * (i as f64 / n_x as f64);
-        for k in 0..n {
-            let y = y_min * (y_max / y_min).powf(k as f64 / (n as f64 - 1.0));
-            let z = Complex::new(x, y);
-            let mag = match op {
-                Op::Sum => (f(z + Complex::new(s, 0.0)) - f(z)).norm(),
-                Op::Mean => f(z).norm(),
-            };
-            if !mag.is_finite() || mag <= 0.0 {
-                continue;
-            }
-            let rate = mag.ln() / y;
-            if rate >= limit - config.decay_tolerance {
-                if verbose {
-                    eprintln!("    [fail] exponential type ≥ {limit:.6} (rate={rate:.6} at x={x:.6})");
+    for sign in [1.0, -1.0] {
+        for i in 0..=n_x {
+            let x = h + s * (i as f64 / n_x as f64);
+            for k in 0..n {
+                let y = y_min * (y_max / y_min).powf(k as f64 / (n as f64 - 1.0));
+                let z = Complex::new(x, sign * y);
+                let mag = match op {
+                    Op::Sum => (f(z + Complex::new(s, 0.0)) - f(z)).norm(),
+                    Op::Mean => f(z).norm(),
+                };
+                if !mag.is_finite() || mag <= 0.0 {
+                    continue;
                 }
-                return false;
+                // borderline types are left to the tail diagnosis
+                let rate = mag.ln() / y;
+                if rate >= limit + config.decay_tolerance {
+                    if verbose {
+                        eprintln!("    [fail] exponential type ≥ {limit:.6} (rate={rate:.6} at x={x:.6}, y={:.1})", sign * y);
+                    }
+                    return Err((rate, limit));
+                }
             }
         }
     }
-    true
+    Ok(())
 }
 
 fn validate_self_consistency<F: Fn(CF) -> CF + Sync, G: Fn(CF) -> CF + Sync>(
@@ -304,7 +320,120 @@ fn validate_discrete_sums<F: Fn(CF) -> CF + Sync, G: Fn(CF) -> CF + Sync>(
     any_ok
 }
 
+#[derive(Clone, Debug)]
+pub(crate) enum Rejection {
+    Type { rate: f64, limit: f64 },
+    Singular,
+    Tail(Resonance),
+    Build(String),
+    Check(&'static str),
+}
+
+impl Rejection {
+    // the highest is reported when every candidate fails
+    fn priority(&self) -> u8 {
+        match self {
+            Rejection::Tail(Resonance::Tone) => 6,
+            Rejection::Tail(Resonance::Exponential) => 5,
+            Rejection::Tail(Resonance::Spread) => 4,
+            Rejection::Type { .. } => 3,
+            Rejection::Build(_) | Rejection::Tail(Resonance::None) => 2,
+            Rejection::Check(_) => 1,
+            Rejection::Singular => 0,
+        }
+    }
+
+    // Another seed plus residue sums may still work: a singularity nearby, or a spread that this
+    // seed cannot resolve (|Re z| comparable to the tail cap).
+    pub(crate) fn may_be_recovered(&self) -> bool {
+        matches!(
+            self,
+            Rejection::Singular
+                | Rejection::Check(_)
+                | Rejection::Build(_)
+                | Rejection::Tail(Resonance::None)
+                | Rejection::Tail(Resonance::Spread)
+        )
+    }
+
+    pub(crate) fn describe(&self, op: Op) -> String {
+        let (thr, tone) = match op {
+            Op::Sum => ("τ/S", "x·e^{iτx/S}"),
+            Op::Mean => ("π/S", "x·e^{iπx/S}"),
+        };
+        match self {
+            Rejection::Type { rate, limit } => format!(
+                "exponential type ≈ {rate:.4} exceeds {thr} = {limit:.4}; principal solutions are not unique there"
+            ),
+            Rejection::Singular => "a singularity lies in or near the strip".to_string(),
+            Rejection::Tail(Resonance::Tone) => format!(
+                "pure-tone resonance at {thr}: no solution of this exponential type, only secular ones such as {tone}"
+            ),
+            Rejection::Tail(Resonance::Exponential) => {
+                format!("the Abel–Plana tail grows exponentially (type above {thr})")
+            }
+            Rejection::Tail(Resonance::Spread) => format!(
+                "spread resonance at {thr}; the finite part of the tail could not be fitted from this strip \
+                 (Config::tail_fp_tol)"
+            ),
+            Rejection::Tail(Resonance::None) => "the Abel–Plana tail integral did not converge".to_string(),
+            Rejection::Build(m) => m.clone(),
+            Rejection::Check(name) => format!("the {name} check failed"),
+        }
+    }
+}
+
 // Validate the seed strip [h, h+S] and, on success, return the operator built on it.
+pub(crate) fn validate_candidate_detailed<F>(
+    g: &F,
+    sum_op: Op,
+    mode: Mode,
+    h: f64,
+    s: f64,
+    config: &Config,
+    verbose: bool,
+) -> Result<AbelPlanaSum<F>, Rejection>
+where
+    F: Fn(CF) -> CF + Sync + Clone,
+{
+    let f = g;
+    // cheapest first
+    validate_decay(f, sum_op, h, s, config, verbose).map_err(|(rate, limit)| Rejection::Type { rate, limit })?;
+    if !strip_is_safe(f, h, s, config, verbose) {
+        if verbose {
+            eprintln!("    [fail] strip validation");
+        }
+        return Err(Rejection::Singular);
+    }
+    let op = AbelPlanaSum::build(g.clone(), sum_op, mode, h, s, config).map_err(|e| {
+        if verbose {
+            eprintln!("    [fail] could not build indefinite sum: {e}");
+        }
+        Rejection::Build(e)
+    })?;
+    if !op.converged() {
+        if verbose {
+            eprintln!("    [fail] Abel–Plana base or tail did not converge ({:?})", op.resonance());
+        }
+        return Err(if op.tails_ok() {
+            Rejection::Build("the Chebyshev base did not converge".to_string())
+        } else {
+            Rejection::Tail(op.resonance())
+        });
+    }
+    if !validate_self_consistency(f, h, s, &op, verbose) {
+        return Err(Rejection::Check("self-consistency"));
+    }
+    if !validate_jump_discontinuities(f, h, s, &op) {
+        return Err(Rejection::Check("continuity"));
+    }
+    if !validate_discrete_sums(f, h, s, &op, verbose) {
+        return Err(Rejection::Check("discrete-sum"));
+    }
+    Ok(op)
+}
+
+#[cfg(test)]
 pub(crate) fn validate_candidate<F>(
     g: &F,
     sum_op: Op,
@@ -317,43 +446,51 @@ pub(crate) fn validate_candidate<F>(
 where
     F: Fn(CF) -> CF + Sync + Clone,
 {
-    let f = g;
-    // cheapest first
-    if !validate_decay(f, sum_op, h, s, config, verbose) {
-        return None;
-    }
-    if !strip_is_safe(f, h, s, config, verbose) {
-        if verbose {
-            eprintln!("    [fail] strip validation");
-        }
-        return None;
-    }
-    let op = match AbelPlanaSum::build(g.clone(), sum_op, mode, h, s, config) {
-        Ok(op) => op,
-        Err(e) => {
-            if verbose {
-                eprintln!("    [fail] could not build indefinite sum: {e}");
-            }
-            return None;
-        }
-    };
-    if !op.converged() {
-        if verbose {
-            eprintln!("    [fail] Abel–Plana base or tail did not converge");
-        }
-        return None;
-    }
-    if validate_self_consistency(f, h, s, &op, verbose)
-        && validate_jump_discontinuities(f, h, s, &op)
-        && validate_discrete_sums(f, h, s, &op, verbose)
-    {
-        Some(op)
-    } else {
-        None
-    }
+    validate_candidate_detailed(g, sum_op, mode, h, s, config, verbose).ok()
 }
 
-// Search for a valid seed strip; returns it with its operator.
+// Hand-picked seeds, then 50 in [-30, 30] from a fixed-seed LCG (Knuth's MMIX constants).
+fn candidate_seeds() -> impl Iterator<Item = f64> {
+    let fixed = [0.1, -0.5, 1.3, -3.4, 10.5];
+    let mut seed = 12345u64;
+    let random = std::iter::repeat_with(move || {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        -30.0 + (seed as f64 / u64::MAX as f64) * 60.0
+    })
+    .take(50);
+    fixed.into_iter().chain(random)
+}
+
+// Search for a valid seed strip; returns it with its operator, or the highest-priority rejection.
+pub(crate) fn auto_find_h_detailed<F>(
+    f: &F,
+    op: Op,
+    mode: Mode,
+    s: f64,
+    config: &Config,
+    verbose: bool,
+) -> Result<(f64, AbelPlanaSum<F>), Rejection>
+where
+    F: Fn(CF) -> CF + Sync + Clone,
+{
+    let mut worst = Rejection::Singular;
+    for h in candidate_seeds() {
+        if verbose {
+            eprintln!("  trying h = {h:>6.2} ...");
+        }
+        match validate_candidate_detailed(f, op, mode, h, s, config, verbose) {
+            Ok(built) => return Ok((h, built)),
+            Err(r) => {
+                if r.priority() > worst.priority() {
+                    worst = r;
+                }
+            }
+        }
+    }
+    Err(worst)
+}
+
+#[cfg(test)]
 pub(crate) fn auto_find_h<F>(
     f: &F,
     op: Op,
@@ -365,24 +502,7 @@ pub(crate) fn auto_find_h<F>(
 where
     F: Fn(CF) -> CF + Sync + Clone,
 {
-    let fixed = [0.1, -0.5, 1.3, -3.4, 10.5];
-    // Then 50 values in [-30, 30] from a fixed-seed LCG (Knuth's MMIX constants).
-    let mut seed = 12345u64;
-    let random = std::iter::repeat_with(move || {
-        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        -30.0 + (seed as f64 / u64::MAX as f64) * 60.0
-    })
-    .take(50);
-
-    for h in fixed.into_iter().chain(random) {
-        if verbose {
-            eprintln!("  trying h = {h:>6.2} ...");
-        }
-        if let Some(built) = validate_candidate(f, op, mode, h, s, config, verbose) {
-            return Some((h, built));
-        }
-    }
-    None
+    auto_find_h_detailed(f, op, mode, s, config, verbose).ok()
 }
 
 #[cfg(test)]
@@ -401,7 +521,7 @@ mod tests {
     #[test]
     fn rejects_type_two_pi() {
         // e^{τiz/S} sits at the resonance: exponential type exactly τ
-        let f = |z: CF| (Complex::new(0.0, 2.0 * PI) * z).exp();
+        let f = |z: CF| (Complex::new(0.0, TAU) * z).exp();
         assert!(validate_candidate(&f, Op::Sum, Mode::Plain, 0.1, 1.0, &Config::default(), false).is_none());
     }
 
@@ -449,5 +569,24 @@ mod tests {
     fn rejects_strip_with_pole() {
         let f = |z: CF| Complex::new(1.0, 0.0) / (z - Complex::new(0.5, 0.0));
         assert!(validate_candidate(&f, Op::Sum, Mode::Plain, 0.1, 1.0, &Config::default(), false).is_none());
+    }
+
+    #[test]
+    fn decay_check_is_two_sided() {
+        // type 7 > τ, below the axis only
+        let f = |z: CF| (Complex::new(0.0, 7.0) * z).exp();
+        let r = validate_candidate_detailed(&f, Op::Sum, Mode::Plain, 0.1, 1.0, &Config::default(), false);
+        assert!(matches!(r, Err(Rejection::Type { .. })), "{:?}", r.err());
+    }
+
+    #[test]
+    fn resonances_are_named() {
+        let cfg = Config::default();
+        let tone = |z: CF| (Complex::new(0.0, PI) * z).exp();
+        let r = validate_candidate_detailed(&tone, Op::Mean, Mode::Plain, 0.1, 1.0, &cfg, false);
+        assert!(matches!(r, Err(Rejection::Tail(Resonance::Tone))), "{:?}", r.err());
+        let sinc = |z: CF| (z * TAU).sin() / (z * PI);
+        let op = validate_candidate_detailed(&sinc, Op::Sum, Mode::Plain, 0.1, 1.0, &cfg, false).expect("spread is accepted");
+        assert_eq!(op.resonance(), Resonance::Spread);
     }
 }
