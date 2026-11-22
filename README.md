@@ -45,6 +45,16 @@ When the step size, zero point, and strip are clear from context, the subscript 
 
 In both examples the zero point is $a=0$. The program may use a different $a$ via `--a`.
 
+## Strips
+
+Without `--h`, a seed strip $[h, h+S]$ is searched and reported (`Using seed strip [h, h+S]`). With `--h`, a valid seed strip is used as is. If $[h, h+S]$ holds a singular point or a cut, the result is the principal solution for the maximal strip containing the line $\Re z = h$, computed from a searched seed by residue sums over the singular points in between. This includes strips narrower than $S$:
+
+```
+cargo run --release -- --function "1/z + 1/(z-0.5)" --h 0.25 --a 0
+```
+
+gives $\psi(x+1) + \psi(\tfrac12 - x) - \psi(1) - \psi(\tfrac12)$, the solution for the strip $(0, \tfrac12)$. A line through a singular point is rejected.
+
 ---
 
 ## Indefinite products
@@ -122,7 +132,7 @@ on the seed strip $[h, h+S]$, then the recurrence $G(x) = 2f(x) - G(x - S)$. The
 
 - `auto` (default): closed forms where known, Abel–Plana for the rest.
 - `plana`: the whole expression through Abel–Plana. Also works for sums and products.
-- `gray` (`--mean` only): the right branch $2\sum_{k\ge1} (-1)^{k-1} f(x+kS)$, summed by Euler's method $(E,1)$. Gray (1966) shows that a regular method summing $\sum z^k$ to $1/(1-z)$ sums the Neumann series of $(\lambda I - T)u = f$ when $\lambda$ is outside the spectrum of $T$; here $\lambda = -1$ and $T$ is the shift. The error falls like $\sin(\tau S/2)^n$ for exponential type $\tau$. It uses only $f$ on the lattice $x + kS$: no strip, no quadrature.
+- `gray` (`--mean` only): the right branch $2\sum_{k\ge1} (-1)^{k-1} f(x+kS)$, summed by Euler's method $(E,1)$. Gray (1966) shows that a regular method summing $\sum z^k$ to $1/(1-z)$ sums the Neumann series of $(\lambda I - T)u = f$ when $\lambda$ is outside the spectrum of $T$; here $\lambda = -1$ and $T$ is the shift. The error falls like $\sin(\sigma S/2)^n$ for exponential type $\sigma$. It uses only $f$ on the lattice $x + kS$: no strip, no quadrature.
 
 The three are independent and are tested against each other (`mean_engines_agree`, and `mean_plana_matches_gray` with closures in `src/abel.rs`). `gray` always gives the right branch, so compare it with an `h` right of every singularity.
 
@@ -175,6 +185,9 @@ print(calc(2.5))
 # Access the selected zero point, seed strip and evaluable range
 print(calc.zero_point, calc.seed, calc.domain)
 
+# Warnings: spread resonance, residue-sum strip, forced build that did not converge
+print(calc.warnings)
+
 # Many points at once, in parallel and without the GIL (nan+nanj at poles)
 print(calc.eval_many([0.5, 1.5, 2.5]))
 ```
@@ -213,6 +226,7 @@ fn main() -> Result<(), norlundcalc::CalcError> {
 
     let values = sum.eval_many(&[0.5, 1.5, 2.5]); // parallel, NaN where eval fails
     let (lo, hi) = sum.domain(); // x range eval accepts
+    let warnings = sum.warnings(); // &[String]
 
     let mean = Calculator::mean("z^2", 1.0, None, false)?;
     let value = mean.eval(2.0)?; // 6 + 0i
@@ -225,7 +239,7 @@ fn main() -> Result<(), norlundcalc::CalcError> {
 }
 ```
 
-`Calculator::sum_with_config`, `product_with_config` and `mean_with_config` take a `Config` (start from `Config::default()`).
+`Calculator::sum_with_config`, `product_with_config` and `mean_with_config` take a `Config` (start from `Config::default()`). `build_sum_raw_detailed` returns a `RawSum` with the evaluator, the seed used (`None` if only closed forms were needed) and the warnings.
 
 ## Cargo features
 
@@ -250,7 +264,7 @@ cargo build --lib --features python --no-default-features
 ## CLI
 
 ```
-  --h <value>           Strip anchor h
+  --h <value>           Strip anchor h; if [h, h+S] is singular, the maximal strip containing Re z = h
   --a <value>           Zero point a
   --step, --S <value>   Step size, default 1.0
   --function, -f <expr> Function to sum
@@ -267,7 +281,7 @@ cargo build --lib --features python --no-default-features
   -h, --help            Usage
 ```
 
-The sixel preview is drawn at the terminal's pixel size (`TIOCGWINSZ`) and only when stdout is a terminal. `NORLUNDCALC_TIMING=1` prints stage timings to stderr.
+The sixel preview is drawn at the terminal's pixel size (`TIOCGWINSZ`) and only when stdout is a terminal. `NORLUNDCALC_TIMING=1` prints stage timings to stderr. Warnings go to stderr as `Warning: ...`.
 
 Example:
 
@@ -336,6 +350,18 @@ Branch cuts are handled by the automatic `h` search:
 cargo run --release -- --function "atanh(z)"
 ```
 
+or by an explicit `h` on the side of the cuts wanted:
+
+```
+cargo run --release -- --function "sqrt((z^2)-1)" --h -2
+```
+
+Spread resonance, accepted with a warning:
+
+```
+cargo run --release -- --function "sin(TAU*z)/(PI*z)"
+```
+
 ---
 
 ## Planned series-expansion fallback
@@ -400,6 +426,6 @@ These formulas are intentionally left as future reference; the current implement
 
 Constants, $(az+b)^p$ (Hurwitz $\zeta$, digamma at $p=-1$, Bernoulli polynomials for integer $0 \le p \le 20$), and $e^{az+b}$, $c^{az+b}$, $\sin(az+b)$, $\cos(az+b)$ (Nørlund's $e^{\beta x}$ example) are summed in closed form; only the remaining terms go through Abel–Plana, combined into one build.
 
-The Abel–Plana seed strip only needs $f$ to be analytic and of exponential type less than $2\pi/S$ ($\pi/S$ for the mean) on the base strip $[h, h+S]$. Global behaviour and poles are handled by recurrence. This allows the method to work for many functions that are not hypergeometric, but it is **not** a computer algebra system.
+The Abel–Plana seed strip only needs $f$ to be analytic and of exponential type at most $\tau/S$ ($\pi/S$ for the mean) on the base strip $[h, h+S]$. Global behaviour and poles are handled by recurrence. This allows the method to work for many functions that are not hypergeometric, but it is **not** a computer algebra system.
 
-Resonance occurs when the exponential type equals an integer multiple of $2\pi/S$ (an odd multiple of $\pi/S$ for the mean); in that case no unique minimal-type principal solution exists.
+Resonance occurs at exponential type $\tau/S$ ($\pi/S$ for the mean). A pure tone there, such as `cos(TAU*z)`, has no solution of that type, only secular ones, and is rejected. A continuous spectrum across it, such as `sin(TAU*z)/(PI*z)` (a spread resonance), has solutions unique only up to $a e^{i\tau x/S} + b e^{-i\tau x/S}$; the finite part of the Abel–Plana tail selects one, shown with a warning.

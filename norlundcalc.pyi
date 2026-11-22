@@ -26,7 +26,12 @@ class Calculator:
         ...
     @property
     def seed(self) -> float:
-        """Left edge h of the seed strip [h, h + step] that was used."""
+        """Left edge h of the seed strip [h, h + step]: the given h, else the searched one.
+        nan for the gray engine and when only closed forms were needed."""
+        ...
+    @property
+    def warnings(self) -> list[str]:
+        """Spread resonance, residue-sum strip, or a forced build that did not converge."""
         ...
     @property
     def domain(self) -> tuple[float, float]:
