@@ -123,6 +123,9 @@ pub(crate) fn clip_segment(
     p1: (f64, f64),
     (x0, y0, x1, y1): (f64, f64, f64, f64),
 ) -> Option<((f64, f64), (f64, f64))> {
+    if (p0.0 < x0 && p1.0 < x0) || (p0.0 > x1 && p1.0 > x1) || (p0.1 < y0 && p1.1 < y0) || (p0.1 > y1 && p1.1 > y1) {
+        return None;
+    }
     let (dx, dy) = (p1.0 - p0.0, p1.1 - p0.1);
     let mut t0: f64 = 0.0;
     let mut t1: f64 = 1.0;
@@ -144,10 +147,13 @@ pub(crate) fn clip_segment(
         }
     }
     // Unclipped ends are returned exactly, so segments chain by equality.
-    let start = if t0 == 0.0 { p0 } else { (p0.0 + t0 * dx, p0.1 + t0 * dy) };
-    let end = if t1 == 1.0 { p1 } else { (p0.0 + t1 * dx, p0.1 + t1 * dy) };
+    let inside = |p: (f64, f64)| (p.0.clamp(x0, x1), p.1.clamp(y0, y1));
+    let start = if t0 == 0.0 { p0 } else { inside((p0.0 + t0 * dx, p0.1 + t0 * dy)) };
+    let end = if t1 == 1.0 { p1 } else { inside((p0.0 + t1 * dx, p0.1 + t1 * dy)) };
     Some((start, end))
 }
+
+const FAR_PX: f64 = 1e9;
 
 // Data -> pixel mapping for the plot rectangle.
 struct Frame {
@@ -161,10 +167,12 @@ struct Frame {
 
 impl Frame {
     fn px(&self, x: f64) -> f64 {
-        self.left + (x - self.x.0) / (self.x.1 - self.x.0) * self.width
+        let v = self.left + (x - self.x.0) / (self.x.1 - self.x.0) * self.width;
+        v.clamp(self.left - FAR_PX, self.left + self.width + FAR_PX)
     }
     fn py(&self, y: f64) -> f64 {
-        self.top + (self.y.1 - y) / (self.y.1 - self.y.0) * self.height
+        let v = self.top + (self.y.1 - y) / (self.y.1 - self.y.0) * self.height;
+        v.clamp(self.top - FAR_PX, self.top + self.height + FAR_PX)
     }
 }
 
@@ -480,5 +488,40 @@ mod tests {
         let (a, b) = clip_segment((5.0, 5.0), (6.0, -1e12), r).unwrap();
         assert_eq!(a, (5.0, 5.0));
         assert!((b.1 - 0.0).abs() < 1e-9 && (b.0 - (5.0 + 5.0 / (1e12 + 5.0))).abs() < 1e-9);
+        assert_eq!(clip_segment((5.0, -2.4e262), (5.1, -3.3e40), r), None);
+        assert_eq!(clip_segment((5.0, 1.3e47), (5.1, 3.7e24), r), None);
+        let (a, b) = clip_segment((5.0, -1e300), (6.0, 1e300), r).unwrap();
+        for p in [a, b] {
+            assert!((0.0..=10.0).contains(&p.0) && (0.0..=10.0).contains(&p.1), "{p:?}");
+        }
+    }
+
+    // e^{1/(z-1)}
+    #[test]
+    fn line_survives_huge_values() {
+        let mut pts: Vec<(f64, f64)> = (0..=100).map(|i| (i as f64 * 0.1, 0.0)).collect();
+        pts[50].1 = 2.9e260; 
+        pts[51].1 = 3.9e38;
+        pts[70].1 = -1e307;
+        let red = Rgb::hex(0xEC9E9E);
+        let fig = Figure {
+            title: "",
+            x_label: "",
+            y_label: "",
+            x_range: (0.0, 10.0),
+            y_range: (-8.0, 8.0),
+            series: vec![Series { points: &pts, color: red, style: Style::Line { width: 2.0 } }],
+            theme: Theme { background: Rgb(0, 0, 0), axis: Rgb(1, 1, 1), grid: Rgb(2, 2, 2), tick: Rgb(3, 3, 3), text: Rgb(4, 4, 4) },
+        };
+        let img = render(&fig, 1.0).unwrap();
+        let is_red = |col: usize, row: usize| {
+            let i = (row * img.width as usize + col) * 4;
+            let px = &img.rgba[i..i + 3];
+            px.iter().zip([red.0, red.1, red.2]).all(|(&a, b)| a.abs_diff(b) <= 3)
+        };
+        let col = |x: f64| (MARGIN_LEFT as f64 + x / 10.0 * (LOGICAL_W - MARGIN_LEFT - MARGIN_RIGHT) as f64) as usize;
+        assert!(is_red(col(2.5), 780), "line at x = 2.5 missing");
+        assert!(is_red(col(8.5), 779), "line at x = 8.5 missing");
+        assert!(is_red(col(6.9), 1200), "drop at x = 6.9 missing");
     }
 }
