@@ -217,7 +217,7 @@ fn mean_above_the_threshold() {
     assert!(Calculator::mean_with_config("sin(4*z)", 1.0, None, false, &config(Engine::Plana)).is_err());
 
     // Type exactly π/S is resonant: no closed form, no Abel-Plana, no Euler limit.
-    let resonant = "sin(3.141592653589793*z)";
+    let resonant = "sin(PI*z)";
     assert!(Calculator::mean(resonant, 1.0, None, false).is_err());
     assert!(Calculator::mean_with_config(resonant, 1.0, None, false, &config(Engine::Gray)).is_err());
 }
@@ -237,4 +237,96 @@ fn sum_engines_agree() {
         Calculator::sum_with_config("z", 1.0, None, None, false, &config(Engine::Gray)),
         Err(CalcError::InvalidInput(_))
     ));
+}
+
+fn digamma(mut x: f64) -> f64 {
+    use std::f64::consts::PI;
+    if x < 0.5 {
+        return digamma(1.0 - x) - PI / (PI * x).tan();
+    }
+    let mut r = 0.0;
+    while x < 10.0 {
+        r -= 1.0 / x;
+        x += 1.0;
+    }
+    let i2 = 1.0 / (x * x);
+    r + x.ln() - 0.5 / x - i2 * (1.0 / 12.0 - i2 * (1.0 / 120.0 - i2 * (1.0 / 252.0 - i2 * (1.0 / 240.0 - i2 / 132.0))))
+}
+
+// h = 0.25 selects the strip (0, 1/2), narrower than the step: ψ(x+1) + ψ(1/2 - x) - ψ(1) - ψ(1/2)
+#[test]
+fn thin_strip_by_explicit_h() {
+    let exact = |x: f64| digamma(x + 1.0) + digamma(0.5 - x) - digamma(1.0) - digamma(0.5);
+    for engine in [Engine::Auto, Engine::Plana] {
+        let calc = Calculator::sum_with_config("1/z + 1/(z-0.5)", 1.0, Some(0.25), Some(0.0), false, &config(engine))
+            .unwrap_or_else(|e| panic!("{engine:?}: {e}"));
+        for &x in &[0.1, 0.25, 0.4, -0.3, 2.9] {
+            let v = calc.eval(x).unwrap();
+            assert!((v - c(exact(x))).norm() < 1e-9 * exact(x).abs().max(1.0), "{engine:?} x={x}: {v} vs {}", exact(x));
+        }
+    }
+    // without h, Auto places closed-form terms by the default seed 0
+    let r = |x: f64| digamma(x + 1.0) + digamma(x + 0.5) - digamma(2.0) - digamma(1.5);
+    for engine in [Engine::Auto, Engine::Plana] {
+        let right = Calculator::sum_with_config("1/z + 1/(z-0.5)", 1.0, Some(1.3), Some(1.0), false, &config(engine)).unwrap();
+        for &x in &[1.6, 3.25] {
+            assert!((right.eval(x).unwrap() - c(r(x))).norm() < 1e-9 * r(x).abs().max(1.0), "{engine:?} x={x}");
+        }
+    }
+}
+
+#[test]
+fn branch_cut_strip_by_explicit_h() {
+    let thin = Calculator::sum("sqrt((z^2)-1)", 1.0, Some(-2.0), Some(-2.5), false).unwrap();
+    assert!(thin.warnings().iter().any(|w| w.contains("residue sums")), "{:?}", thin.warnings());
+    let direct = Calculator::sum("sqrt((z^2)-1)", 1.0, Some(-5.0), Some(-2.5), false).unwrap();
+    for &x in &[-6.3, -1.7, -0.6, 0.4, 3.3] {
+        let (a, b) = (thin.eval(x).unwrap(), direct.eval(x).unwrap());
+        assert!((a - b).norm() < 1e-9 * b.norm().max(1.0), "x={x}: {a} vs {b}");
+    }
+    assert!(Calculator::sum("sqrt((z^2)-1)", 1.0, Some(0.3), None, false).is_err());
+}
+
+// truncated constants: just inside the threshold, still a spread
+#[test]
+fn near_resonant_spread_warns() {
+    let expr = "sin(6.2831853*z)/(3.141592*z)";
+    let a = Calculator::sum(expr, 1.0, None, Some(0.5), false).unwrap();
+    assert!(a.warnings().iter().any(|w| w.contains("resonance")), "{:?}", a.warnings());
+    let b = Calculator::sum(expr, 1.0, Some(-1.3), Some(0.5), false).unwrap();
+    for &x in &[-2.3, 0.7, 2.6] {
+        assert!((a.eval(x).unwrap() - b.eval(x).unwrap()).norm() < 1e-6, "x={x}");
+    }
+}
+
+#[test]
+fn spread_resonance_warns() {
+    use std::f64::consts::{PI, TAU};
+    let calc = Calculator::sum("sin(TAU*z)/(PI*z)", 1.0, None, Some(0.0), false).unwrap();
+    assert!(calc.warnings().iter().any(|w| w.contains("resonance")), "{:?}", calc.warnings());
+    for &x in &[0.6, 1.7, 3.3] {
+        let d = calc.eval(x).unwrap() - calc.eval(x - 1.0).unwrap();
+        let f = (TAU * x).sin() / (PI * x);
+        assert!((d - c(f)).norm() < 1e-9, "x={x}: {d} vs {f}");
+    }
+}
+
+#[test]
+fn pure_tone_is_reported() {
+    let e = Calculator::sum("cos(TAU*z)", 1.0, None, None, false).err().expect("no solution of this type");
+    assert!(e.to_string().contains("pure-tone"), "{e}");
+}
+
+// [40, 41] cannot resolve the spread tail; residue sums from a near seed give the h = 1 solution
+#[test]
+fn far_h_for_a_spread_resonance() {
+    let expr = "sin(TAU*z)/(PI*z)";
+    let near = Calculator::sum(expr, 1.0, Some(1.0), Some(0.5), false).unwrap();
+    for h in [40.0, -55.0] {
+        let far = Calculator::sum(expr, 1.0, Some(h), Some(0.5), false).unwrap_or_else(|e| panic!("h={h}: {e}"));
+        for &x in &[-2.3, 0.7, 2.6] {
+            let (a, b) = (far.eval(x).unwrap(), near.eval(x).unwrap());
+            assert!((a - b).norm() < 1e-7, "h={h} x={x}: {a} vs {b}");
+        }
+    }
 }
