@@ -21,9 +21,9 @@ Indefinite products and the mean inverse (Nørlund's Wechselsumme) are implement
 The indefinite sum (antidifference) operator is written as
 
 $$
-{}^{[\text{strip}]}\nabla_{S,a}^{-1} f(x)\,\delta x
+{}^{[\text{strip}]}\nabla_{S,a}^{-1} f(x)\thinspace \delta x
 \qquad\text{or}\qquad
-{}^{[\text{strip}]}\Delta_{S,a}^{-1} f(x)\,\delta x,
+{}^{[\text{strip}]}\Delta_{S,a}^{-1} f(x)\thinspace \delta x,
 $$
 
 where
@@ -39,18 +39,23 @@ When the step size, zero point, and strip are clear from context, the subscript 
 
 **Examples**
 
-- Entire function: $\nabla_{1,0}^{-1} x\ \delta x = \frac{x(x+1)}{2}$.
-- Pole-free strip:
+Entire function:
 
-  $$
-  {}^{(0,\infty)}\nabla_{1,0}^{-1} \frac{1}{x^2+1}\,\delta x = \mathrm{Im}\,\psi(1+i) - \mathrm{Im}\,\psi(x+1+i).
-  $$
+$$
+\nabla_{1,0}^{-1} x\thinspace \delta x = \frac{x(x+1)}{2}.
+$$
+
+Pole-free strip:
+
+$$
+{}^{(0,\infty)}\nabla_{1,0}^{-1} \frac{1}{x^2+1}\thinspace \delta x = \mathrm{Im}\thinspace \psi(1+i) - \mathrm{Im}\thinspace \psi(x+1+i).
+$$
 
 In both examples the zero point is $a=0$. The program may use a different $a$ via `--a`.
 
 ## Strips
 
-Without `--h`, a seed strip $[h, h+S]$ is searched and reported (`Using seed strip [h, h+S]`). With `--h`, a valid seed strip is used as is. If $[h, h+S]$ holds a singular point or a cut, the result is the principal solution for the maximal strip containing the line $\mathrm{Re}\ z = h$, computed from a searched seed by residue sums over the singular points in between. This includes strips narrower than $S$:
+Without `--h`, a seed strip $[h, h+S]$ is searched and reported (`Using seed strip [h, h+S]`). With `--h`, a valid seed strip is used as is. If $[h, h+S]$ holds a singular point or a cut, the result is the principal solution for the maximal strip containing the line $\mathrm{Re}\thinspace z = h$, computed from a searched seed by residue sums over the singular points in between. This includes strips narrower than $S$:
 
 ```
 cargo run --release -- --function "1/z + 1/(z-0.5)" --h 0.25 --a 0
@@ -58,13 +63,13 @@ cargo run --release -- --function "1/z + 1/(z-0.5)" --h 0.25 --a 0
 
 gives $\psi(x+1) + \psi(\tfrac12 - x) - \psi(1) - \psi(\tfrac12)$, the solution for the strip $(0, \tfrac12)$. A line through a singular point is rejected.
 
-A seed strip lying on a horizontal branch cut is rejected by validation, since Abel–Plana would take $f$ from both sides of the cut. With an explicit `--h` on such a cut, $f$ takes its values from above and is continued below the axis, provided the jump $f_\uparrow - f_\downarrow$ (or the ratio $f_\uparrow / f_\downarrow$) is constant along the strip. The glued function is then analytic across the cut, so the continuation is exact, and the result is the principal solution for the cut turned downward. This covers powers and roots (a constant factor), logarithms and $\mathrm{atanh}$ (a constant offset), and anything multiplied by or added to an analytic function. For $\sqrt z$ with `--h -5` it gives $i\ \zeta(-\tfrac12, -x)$; for $e^{\sqrt z}$, whose continuation is neither, the strip is rejected.
+A seed strip lying on a horizontal branch cut is rejected by validation, since Abel–Plana would take $f$ from both sides of the cut. With an explicit `--h` on such a cut, $f$ takes its values from above and is continued below the axis, provided the jump $f_\uparrow - f_\downarrow$ (or the ratio $f_\uparrow / f_\downarrow$) is constant along the strip. The glued function is then analytic across the cut, so the continuation is exact, and the result is the principal solution for the cut turned downward. This covers powers and roots (a constant factor), logarithms and $\mathrm{atanh}$ (a constant offset), and anything multiplied by or added to an analytic function. For $\sqrt z$ with `--h -5` it gives $i\thinspace \zeta(-\tfrac12, -x)$; for $e^{\sqrt z}$, whose continuation is neither, the strip is rejected.
 
 With a cut in use, $f$ takes its values from above on the whole real axis wherever it jumps, whatever its formula returns there. The search tries cut-free seeds first and then seeds on cuts, and residue sums run from either. So a strip between two branch points with cuts along the rest of the axis is reached too: for $\mathrm{atanh}\sqrt z$, `--h 0.5` gives the solution for $(0, 1)$, the same from a seed on either cut.
 
 ## Complex evaluation
 
-The solution can be evaluated off the real axis. Terms summed by Abel–Plana use the Abel–Plana formula itself at the complex point, the recurrence along the horizontal line through it, and residue-sum strips with the rectangle grown by $|\mathrm{Im}\ z|$. The closed forms for exponentials, sines and cosines of $az+b$, $\nabla_S^{-1}e^{cz}=e^{cz}/(1-e^{-cS})$, and for polynomials (powers $(az+b)^p$ with integer $0\le p\le20$) are entire and are evaluated as they are. Those for logarithms and other powers are real-only; with one of them present, `--im` and `--portrait` switch to `--engine plana`, which sums the whole expression by Abel–Plana. `--im Y` plots the line $\mathrm{Im}\ z = Y$:
+The solution can be evaluated off the real axis. Terms summed by Abel–Plana use the Abel–Plana formula itself at the complex point, the recurrence along the horizontal line through it, and residue-sum strips with the rectangle grown by $|\mathrm{Im}\thinspace z|$. The closed forms for exponentials, sines and cosines of $az+b$, $\nabla_S^{-1}e^{cz}=e^{cz}/(1-e^{-cS})$, and for polynomials (powers $(az+b)^p$ with integer $0\le p\le20$) are entire and are evaluated as they are. Those for logarithms and other powers are real-only; with one of them present, `--im` and `--portrait` switch to `--engine plana`, which sums the whole expression by Abel–Plana. `--im Y` plots the line $\mathrm{Im}\thinspace z = Y$:
 
 ```
 cargo run --release -- --function "1/(z^2+1)" --im 0.7
@@ -72,7 +77,7 @@ cargo run --release -- --function "1/(z^2+1)" --im 0.7
 
 The closed forms reach beyond Abel–Plana: `sin(7*z)` has exponential type $7>\tau$ on every vertical line, so no seed strip exists, but its closed form, the solution of Nørlund's summation definition away from resonance, works at every complex point.
 
-Along a row $\mathrm{Im}\ z = y$ the base is fitted once, as a Chebyshev series in $\mathrm{Re}\ z$ over the seed strip (and the residue-sum correction over one period), so a row of points costs about one fit instead of one Abel–Plana tail per point. Where the fit does not converge, as on a row through a singular point, each point gets its own base. `eval_row` and `eval_grid` use this; the values agree with `eval_complex` to the fit tolerance.
+Along a row $\mathrm{Im}\thinspace z = y$ the base is fitted once, as a Chebyshev series in $\mathrm{Re}\thinspace z$ over the seed strip (and the residue-sum correction over one period), so a row of points costs about one fit instead of one Abel–Plana tail per point. Where the fit does not converge, as on a row through a singular point, each point gets its own base. `eval_row` and `eval_grid` use this; the values agree with `eval_complex` to the fit tolerance.
 
 ### Phase portraits
 
@@ -84,7 +89,7 @@ Along a row $\mathrm{Im}\ z = y$ the base is fitted once, as a Chebyshev series 
 - rings and sectors fade where neighbouring samples are more than half a band apart, which would otherwise alias into moiré;
 - grey marks points without a value: a singular point, a recurrence through one, or outside the reachable range.
 
-The image has no axes: `portrait.png` has one pixel per sample, `--points` across $\mathrm{Re}\ z$ (default 1200) with square cells, and the ranges are printed. Each row of samples has its own fit of the base, so a seam at a strip edge $h + mS$ would show where one went wrong; the program checks one edge and warns.
+The image has no axes: `portrait.png` has one pixel per sample, `--points` across $\mathrm{Re}\thinspace z$ (default 1200) with square cells, and the ranges are printed. Each row of samples has its own fit of the base, so a seam at a strip edge $h + mS$ would show where one went wrong; the program checks one edge and warns.
 
 ```
 cargo run --release -- --function "1/(z^2+1)" --portrait --xmin -6 --xmax 4 --ymin -3 --ymax 3
@@ -131,11 +136,11 @@ $f$ is split into top level factors, and the logarithm of each known factor is s
 | factor | $\ln$ factor | summed with |
 |---|---|---|
 | constant $c$ | $\ln c$ | $\frac{x}{S}\ln c$ |
-| $(az+b)^p$, $a>0$ (including $z$, $az+b$) | $p\ln(az+b)$ | $\ln\Pi$ ($\Pi(t)=\Gamma(t+1)$) |
+| $(az+b)^p$, $a>0$ (including $z$, $az+b$) | $p\ln(az+b)$ | $\ln\Pi$ |
 | $e^{g(z)}$ | $g(z)$ | the sum path for $g$ |
 | $c^{g(z)}$, $c>0$ | $g(z)\ln c$ | the sum path for $g$ |
 
-Any other factor $h$ goes through Abel–Plana as $\ln h$, continued along the tail rays so that branch cuts of the principal logarithm do not enter. Several such factors share one Abel–Plana build.
+Here $\Pi(t) = \Gamma(t+1)$. Any other factor $h$ goes through Abel–Plana as $\ln h$, continued along the tail rays so that branch cuts of the principal logarithm do not enter. Several such factors share one Abel–Plana build.
 
 Example:
 
@@ -169,7 +174,7 @@ Closed forms, with $t = x/S$:
 |---|---|
 | constant $c$ | $c$ |
 | $x^p$, integer $0 \le p \le 20$ | $S^p E_p(t+1)$ (Euler polynomials) |
-| $x^p$, other $p$ | right $2S^p\ \eta(-p, t+1)$, left $2S^p e^{i\pi p}\ \eta(-p, -t)$ |
+| $x^p$, other $p$ | right $2S^p\thinspace \eta(-p, t+1)$, left $2S^p e^{i\pi p}\thinspace \eta(-p, -t)$ |
 | $e^{cx}$ | $2e^{cx}/(1+e^{-cS})$, resonant at $cS = i\pi(2k+1)$ |
 | $\sin$, $\cos$ | through Euler's formula |
 
@@ -178,7 +183,7 @@ Here $\eta(s,a) = \sum_{k\ge0} (-1)^k (k+a)^{-s}$; $p=-1$ gives $\tfrac2S\beta(t
 Other terms go through Abel–Plana with the alternating kernel,
 
 $$
-G(x) = f(x) - i\int_0^\infty \frac{f(x+iSt) - f(x-iSt)}{\sinh \pi t}\,dt,
+G(x) = f(x) - i\int_0^\infty \frac{f(x+iSt) - f(x-iSt)}{\sinh \pi t}\thinspace dt,
 $$
 
 on the seed strip $[h, h+S]$, then the recurrence $G(x) = 2f(x) - G(x - S)$. There is no $\int^x f$ term. Strips on different sides of a singularity give solutions that differ by an antiperiodic function, as with sums.
