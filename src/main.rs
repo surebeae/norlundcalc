@@ -1,22 +1,18 @@
-use norlundcalc::{build_sum_raw_detailed, Calculator, Config, Engine};
-use num_complex::Complex;
-use rayon::prelude::*;
-use std::env;
-use std::io::{BufWriter, Write};
-use std::path::PathBuf;
+#[cfg(feature = "cli")]
+use std::io::Write;
 use std::process::ExitCode;
 use std::time::Instant;
 
+mod app;
+#[path = "par.rs"]
+#[allow(dead_code)] // shared with the library, which also uses par::any
+mod par;
 #[cfg(feature = "cli")]
 mod plot;
 #[cfg(feature = "cli")]
 mod sixel;
 
-type Point = (f64, f64);
-type Points = Vec<Point>;
-type Eval = Box<dyn Fn(f64) -> Complex<f64> + Send + Sync>;
-
-const MAX_POINTS: usize = 1_000_000;
+use app::{Args, Notes, FLAGS};
 
 const USAGE: &str = "\
 usage: norlundcalc-cli [options]
@@ -25,13 +21,25 @@ usage: norlundcalc-cli [options]
       --h H             left edge of the seed strip [h, h+S] (default: search); if that
                         strip is singular, the maximal strip containing Re z = H
       --a A             zero point, F(a) = 0 (default: search; 0 for --product)
+      --im Y            evaluate on the line Im z = Y (default: 0; --engine plana if needed)
+      --order N         apply the sum (or product) N times, each order vanishing (equal to 1)
+                        at a; at most 64; not for --mean (default: 1)
       --xmin X          plot range (default: -4)
       --xmax X          (default: 19)
-      --ymin Y          (default: -8)
+      --ymin Y          value range, or Im z with --portrait (default: -8)
       --ymax Y          (default: 8)
-      --points N        samples on [xmin, xmax] (default: 2400, max 1000000)
+      --points N        samples on [xmin, xmax] (default: 2400, max 1000000; with --portrait:
+                        samples across Re z, default 1200, max 8192)
       --out-dir DIR     where CSV/PNG files go (default: .)
-      --png-scale K     PNG file size, K x 2400x1600 px (default: 2, max 3; 0 = no PNG file)
+      --png-scale K     PNG file size, K x 2400x1600 px (default: 2, max 3; 0 = no PNG file);
+                        with --portrait one pixel per sample, and 0 still means no file
+      --portrait        phase portrait of F on [xmin, xmax] + i[ymin, ymax] instead of a plot
+                        along a line, without axes; the ranges are printed (--engine plana if needed)
+      --modulus B       with --portrait: rings at |F| = B^k, 0 for none (default: 2)
+      --phase-lines N   with --portrait: shade N sectors of arg F, 0 for none (default: 0)
+      --h2 H            show F for the seed h minus F for the seed H (sums share the zero point;
+                        products show the quotient): 0 where both strips give the same solution;
+                        no discrete_sums.csv
       --product         indefinite product instead of sum
       --mean            mean inverse (Wechselsumme), (G(x) + G(x-S))/2 = f(x); no --a
       --engine E        auto (closed forms + Abel-Plana), plana (all Abel-Plana),
@@ -40,175 +48,24 @@ usage: norlundcalc-cli [options]
       --no-display      do not render the plot
   -h, --help";
 
-struct CliArgs {
-    h: Option<f64>,
-    a: Option<f64>,
-    step: f64,
-    function: String,
-    xmin: f64,
-    xmax: f64,
-    #[cfg_attr(not(feature = "cli"), allow(dead_code))]
-    ymin: f64,
-    #[cfg_attr(not(feature = "cli"), allow(dead_code))]
-    ymax: f64,
-    points: usize,
-    out_dir: PathBuf,
-    #[cfg_attr(not(feature = "cli"), allow(dead_code))]
-    png_scale: f64,
-    no_display: bool,
-    force: bool,
-    product: bool,
-    mean: bool,
-    engine: Engine,
-}
-
-fn parse_args() -> Result<Option<CliArgs>, String> {
-    let args: Vec<String> = env::args().skip(1).collect();
-    let mut out = CliArgs {
-        h: None,
-        a: None,
-        step: 1.0,
-        function: "sin(z*z)".to_string(),
-        xmin: -4.0,
-        xmax: 19.0,
-        ymin: -8.0,
-        ymax: 8.0,
-        points: 2400,
-        out_dir: PathBuf::from("."),
-        png_scale: 2.0,
-        no_display: false,
-        force: false,
-        product: false,
-        mean: false,
-        engine: Engine::Auto,
-    };
-    let mut it = args.iter();
-
-    fn value<'a>(it: &mut std::slice::Iter<'a, String>, flag: &str) -> Result<&'a str, String> {
-        it.next().map(String::as_str).ok_or_else(|| format!("{flag} needs a value"))
-    }
-    fn number(s: &str, flag: &str) -> Result<f64, String> {
-        let v: f64 = s.parse().map_err(|_| format!("{flag}: `{s}` is not a number"))?;
-        if v.is_finite() {
-            Ok(v)
-        } else {
-            Err(format!("{flag} must be finite"))
-        }
-    }
-
+// argv to (name, value) pairs for Args::parse; None when asking for help.
+fn parse_args() -> Result<Option<Args>, String> {
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let mut pairs = Vec::new();
+    let mut it = argv.iter();
     while let Some(arg) = it.next() {
-        match arg.as_str() {
-            "--h" => out.h = Some(number(value(&mut it, arg)?, arg)?),
-            "--a" => out.a = Some(number(value(&mut it, arg)?, arg)?),
-            "--step" | "--S" => out.step = number(value(&mut it, arg)?, arg)?,
-            "--function" | "-f" => out.function = value(&mut it, arg)?.to_string(),
-            "--xmin" => out.xmin = number(value(&mut it, arg)?, arg)?,
-            "--xmax" => out.xmax = number(value(&mut it, arg)?, arg)?,
-            "--ymin" => out.ymin = number(value(&mut it, arg)?, arg)?,
-            "--ymax" => out.ymax = number(value(&mut it, arg)?, arg)?,
-            "--points" => {
-                let v = value(&mut it, arg)?;
-                out.points = v.parse().map_err(|_| format!("--points: `{v}` is not a positive integer"))?;
-            }
-            "--out-dir" => out.out_dir = PathBuf::from(value(&mut it, arg)?),
-            "--png-scale" => out.png_scale = number(value(&mut it, arg)?, arg)?,
-            "--no-display" => out.no_display = true,
-            "--force" => out.force = true,
-            "--product" => out.product = true,
-            "--mean" => out.mean = true,
-            "--engine" => {
-                out.engine = match value(&mut it, arg)? {
-                    "auto" => Engine::Auto,
-                    "plana" => Engine::Plana,
-                    "gray" => Engine::Gray,
-                    other => return Err(format!("--engine: `{other}` is not auto, plana or gray")),
-                }
-            }
-            "-h" | "--help" => return Ok(None),
-            other => return Err(format!("unknown argument: {other}")),
+        let name = match arg.as_str() {
+            "-f" => "function",
+            "-h" => "help",
+            other => other.strip_prefix("--").ok_or_else(|| format!("unknown argument: {other}"))?,
+        };
+        if name == "help" {
+            return Ok(None);
         }
+        let value = if FLAGS.contains(&name) { None } else { it.next().map(String::as_str) };
+        pairs.push((name, value));
     }
-
-    if !(out.step > 0.0) {
-        return Err("--step must be greater than 0".to_string());
-    }
-    if !(out.xmin < out.xmax) {
-        return Err("--xmin must be less than --xmax".to_string());
-    }
-    if !(out.ymin < out.ymax) {
-        return Err("--ymin must be less than --ymax".to_string());
-    }
-    if !(0.0..=3.0).contains(&out.png_scale) {
-        return Err("--png-scale must be between 0 and 3".to_string());
-    }
-    if out.points < 2 || out.points > MAX_POINTS {
-        return Err(format!("--points must be between 2 and {MAX_POINTS}"));
-    }
-    if out.mean && out.product {
-        return Err("--mean and --product cannot be combined".to_string());
-    }
-    if out.mean && out.a.is_some() {
-        return Err("--mean has no zero point; drop --a".to_string());
-    }
-    if out.engine == Engine::Gray && !out.mean {
-        return Err("--engine gray needs --mean".to_string());
-    }
-    Ok(Some(out))
-}
-
-// First finite point among 0, -1, 1, -2, 2, ... within the plot range (+/- 10).
-fn auto_find_a(eval: &(impl Fn(f64) -> Complex<f64> + Sync), xmin: f64, xmax: f64) -> Option<f64> {
-    (0..=2000)
-        .map(|n: i64| if n % 2 == 0 { (n / 2) as f64 } else { -((n + 1) / 2) as f64 })
-        .filter(|&c| c >= xmin - 10.0 && c <= xmax + 10.0)
-        .find(|&c| {
-            let v = eval(c);
-            v.re.is_finite() && v.im.is_finite()
-        })
-}
-
-fn report(args: &CliArgs, seed: Option<f64>, warnings: &[String]) {
-    if args.h.is_none() {
-        if let Some(h) = seed.filter(|h| h.is_finite()) {
-            println!("Using seed strip [{h}, {}]; pass --h to choose another", h + args.step);
-        }
-    }
-    for w in warnings {
-        eprintln!("Warning: {w}");
-    }
-}
-
-// The evaluator and the lattice origin for the dots (the zero point for sums and products).
-fn build(args: &CliArgs) -> Result<(f64, Eval), String> {
-    let s = args.step;
-    let mut config = Config::default();
-    config.engine = args.engine;
-    let wrap = |calc: Calculator| -> Eval {
-        report(args, Some(calc.seed()), calc.warnings());
-        Box::new(move |x| calc.eval(x).unwrap_or(Complex::new(f64::NAN, f64::NAN)))
-    };
-    if args.mean {
-        let calc = Calculator::mean_with_config(&args.function, s, args.h, args.force, &config).map_err(|e| e.to_string())?;
-        return Ok((0.0, wrap(calc)));
-    }
-    if args.product {
-        let a = args.a.unwrap_or(0.0);
-        let calc = Calculator::product_with_config(&args.function, s, args.h, Some(a), args.force, &config)
-            .map_err(|e| e.to_string())?;
-        return Ok((a, wrap(calc)));
-    }
-    if let Some(a) = args.a {
-        let calc =
-            Calculator::sum_with_config(&args.function, s, args.h, Some(a), args.force, &config).map_err(|e| e.to_string())?;
-        return Ok((a, wrap(calc)));
-    }
-    let built = build_sum_raw_detailed(&args.function, s, args.h, None, args.force, &config).map_err(|e| e.to_string())?;
-    report(args, built.seed, &built.warnings);
-    let raw = built.eval;
-    let a = auto_find_a(&raw, args.xmin, args.xmax).ok_or("no finite zero point found near the plot range; pass --a")?;
-    println!("Using zero point a = {a}");
-    let offset = raw(a);
-    Ok((a, Box::new(move |x| raw(x) - offset)))
+    Args::parse(pairs).map(Some)
 }
 
 // Stage timings on stderr when NORLUNDCALC_TIMING is set.
@@ -218,76 +75,12 @@ fn timing(label: &str, since: Instant) {
     }
 }
 
-#[cfg(feature = "cli")]
-struct PlotData<'a> {
-    real: &'a [Point],
-    imag: &'a [Point],
-    disc_real: &'a [Point],
-    disc_imag: &'a [Point],
-    product: bool,
-    mean: bool,
-    a: f64,
-    x: (f64, f64),
-    y: (f64, f64),
-}
-
-#[cfg(feature = "cli")]
-impl PlotData<'_> {
-    // Render at scale x (2400 x 1600) px.
-    fn render(&self, scale: f32) -> Result<plot::Image, String> {
-        use plot::{Figure, Rgb, Series, Style, Theme};
-        let a = self.a;
-        let title = if self.mean {
-            "mean inverse, (G(x) + G(x-S))/2 = f(x) — lines (continuous) & dots (x = S·k)".to_string()
-        } else if self.product {
-            format!("Π u(S·k+a) — lines (continuous) & dots (integer products), a={a}")
-        } else {
-            format!("Σ f(S·k+a) — lines (continuous) & dots (integer sums), a={a}")
-        };
-        let (red, cyan) = (Rgb::hex(0xEC9E9E), Rgb::hex(0x37BBBF));
-        let fig = Figure {
-            title: &title,
-            x_label: "x",
-            y_label: if self.mean {
-                "G(x)"
-            } else if self.product {
-                "Π u(S·k+a)"
-            } else {
-                "Σ f(S·k+a)"
-            },
-            x_range: self.x,
-            y_range: self.y,
-            series: vec![
-                Series { points: self.real, color: red, style: Style::Line { width: 2.0 } },
-                Series { points: self.imag, color: cyan, style: Style::Line { width: 2.0 } },
-                Series { points: self.disc_real, color: red, style: Style::Dots { radius: 5.0 } },
-                Series { points: self.disc_imag, color: cyan, style: Style::Dots { radius: 5.0 } },
-            ],
-            theme: Theme {
-                background: Rgb::hex(0x444444),
-                axis: Rgb::hex(0x333333),
-                grid: Rgb::hex(0x999999),
-                tick: Rgb::hex(0x555555),
-                text: Rgb::hex(0xFFFFC6),
-            },
-        };
-        plot::render(&fig, scale)
+fn print(notes: &mut Notes) {
+    for line in notes.info.drain(..) {
+        println!("{line}");
     }
-
-    // Sixel preview rendered directly at the terminal's pixel size.
-    fn preview(&self) -> Result<String, String> {
-        let t = Instant::now();
-        let (px_w, px_h, rows) = terminal_pixels().unwrap_or((800, 480, 24));
-        // Leave two text rows for the prompt and the "Done" line.
-        let usable_h = px_h as f32 * (rows.saturating_sub(2).max(1) as f32 / rows.max(1) as f32);
-        let scale = (px_w as f32 / plot::LOGICAL_W).min(usable_h / plot::LOGICAL_H).clamp(0.05, 1.0);
-        let img = self.render(scale)?;
-        timing("preview render", t);
-
-        let t = Instant::now();
-        let out = sixel::encode(&img.rgba, img.width as usize, img.height as usize);
-        timing("sixel encode", t);
-        Ok(out)
+    for w in notes.warnings.drain(..) {
+        eprintln!("Warning: {w}");
     }
 }
 
@@ -311,106 +104,139 @@ fn terminal_pixels() -> Option<(u32, u32, u16)> {
     None
 }
 
-fn write_csv(path: &std::path::Path, re: &[Point], im: &[Point]) -> std::io::Result<()> {
-    let mut w = BufWriter::new(std::fs::File::create(path)?);
-    writeln!(w, "x,real,imag")?;
-    for (r, i) in re.iter().zip(im) {
-        writeln!(w, "{:.6},{:.12},{:.12}", r.0, r.1, i.1)?;
-    }
-    w.flush()
-}
-
-fn run(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
+fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let start = Instant::now();
-    let s = args.step;
-    let (zero_point_a, final_eval) = build(&args)?;
+    let mut notes = Notes::default();
+    let built = app::build(&args, &mut notes).and_then(|first| {
+        let second = app::build_second(&args, &first, &mut notes)?;
+        Ok((first, second))
+    });
+    print(&mut notes);
+    let (first, second) = built?;
     timing("build", start);
     let t_eval = Instant::now();
 
-    let n_steps = args.points - 1;
-    let dx = (args.xmax - args.xmin) / n_steps as f64;
-    let (real_points, imag_points): (Points, Points) = (0..=n_steps)
-        .into_par_iter()
-        .map(|i| {
-            let x = args.xmin + i as f64 * dx;
-            let val = final_eval(x);
-            ((x, if val.re.is_finite() { val.re } else { f64::NAN }), (x, if val.im.is_finite() { val.im } else { f64::NAN }))
-        })
-        .unzip();
-
-    // Integer points a + mS in range.
-    let m_min = ((args.xmin - zero_point_a) / s).ceil();
-    let m_max = ((args.xmax - zero_point_a) / s).floor();
-    let (mut disc_real, mut disc_imag): (Points, Points) = (Vec::new(), Vec::new());
-    if m_max >= m_min && m_max - m_min <= MAX_POINTS as f64 {
-        for m in (m_min as i64)..=(m_max as i64) {
-            let x = zero_point_a + m as f64 * s;
-            let v = final_eval(x);
-            if v.re.is_finite() && v.im.is_finite() {
-                disc_real.push((x, v.re));
-                disc_imag.push((x, v.im));
-            }
-        }
+    #[cfg(feature = "cli")]
+    if args.portrait {
+        let portrait = app::portrait(&args, &first, second.as_ref(), &mut notes)?;
+        print(&mut notes);
+        timing("evaluate", t_eval);
+        show_portrait(&args, &portrait)?;
+        done(&args, start);
+        return Ok(());
     }
 
+    let line = app::line_data(&args, &first, second.as_ref());
     timing("evaluate", t_eval);
     let t_csv = Instant::now();
     std::fs::create_dir_all(&args.out_dir)?;
-    write_csv(&args.out_dir.join("indefinite_sum.csv"), &real_points, &imag_points)?;
-    write_csv(&args.out_dir.join("discrete_sums.csv"), &disc_real, &disc_imag)?;
+    std::fs::write(args.out_dir.join("indefinite_sum.csv"), app::csv(&line.real, &line.imag))?;
+    // a difference of two seeds has no dots
+    if second.is_none() {
+        std::fs::write(args.out_dir.join("discrete_sums.csv"), app::csv(&line.disc_real, &line.disc_imag))?;
+    }
     timing("csv", t_csv);
 
     #[cfg(feature = "cli")]
     if !args.no_display {
-        let plot = PlotData {
-            real: &real_points,
-            imag: &imag_points,
-            disc_real: &disc_real,
-            disc_imag: &disc_imag,
-            product: args.product,
-            mean: args.mean,
-            a: zero_point_a,
-            x: (args.xmin, args.xmax),
-            y: (args.ymin, args.ymax),
-        };
-        let png_path = args.out_dir.join("indefinite_sum.png");
-        let stdout_is_tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
-        // PNG file and terminal preview render concurrently.
-        let (file_result, preview) = std::thread::scope(|scope| {
-            let file = scope.spawn(|| -> Result<bool, String> {
-                if args.png_scale == 0.0 {
-                    return Ok(false);
-                }
-                let t = Instant::now();
-                let img = plot.render(args.png_scale as f32)?;
-                plot::write_png(&img, &png_path)?;
-                timing("png file (render + write)", t);
-                Ok(true)
-            });
-            let preview = if stdout_is_tty { Some(plot.preview()) } else { None };
-            (file.join().unwrap_or_else(|_| Err("PNG rendering panicked".to_string())), preview)
-        });
-        if file_result? {
-            println!("PNG saved to {}", png_path.display());
-        }
-        match preview {
-            Some(Ok(sixel)) => {
-                let t = Instant::now();
-                let mut out = std::io::stdout().lock();
-                out.write_all(sixel.as_bytes())?;
-                out.flush()?;
-                timing("sixel write", t);
-            }
-            Some(Err(e)) => eprintln!("terminal preview failed: {e}"),
-            None => {} // not a terminal
-        }
+        show(&args, &app::PlotData::new(&args, &line, &first, second.as_ref()), "indefinite_sum.png")?;
     }
 
     #[cfg(not(feature = "cli"))]
     if !args.no_display {
         eprintln!("Plotting is disabled in this build. Use --no-display to silence this message.");
     }
+    done(&args, start);
+    Ok(())
+}
 
+// Sixel preview rendered directly at the terminal's pixel size.
+#[cfg(feature = "cli")]
+fn preview(plot: &app::PlotData<'_>) -> Result<String, String> {
+    let t = Instant::now();
+    let (px_w, px_h, rows) = terminal_pixels().unwrap_or((800, 480, 24));
+    // Leave two text rows for the prompt and the "Done" line.
+    let usable_h = px_h as f32 * (rows.saturating_sub(2).max(1) as f32 / rows.max(1) as f32);
+    let scale = (px_w as f32 / plot::LOGICAL_W).min(usable_h / plot::LOGICAL_H).clamp(0.05, 1.0);
+    let img = plot.render(scale)?;
+    timing("preview render", t);
+
+    let t = Instant::now();
+    let out = sixel::encode(&img.rgba, img.width as usize, img.height as usize);
+    timing("sixel encode", t);
+    Ok(out)
+}
+
+// PNG with one pixel per sample, and a terminal preview scaled to fit.
+#[cfg(feature = "cli")]
+fn show_portrait(args: &Args, p: &app::PortraitImage) -> Result<(), Box<dyn std::error::Error>> {
+    if args.png_scale != 0.0 {
+        let t = Instant::now();
+        std::fs::create_dir_all(&args.out_dir)?;
+        let path = args.out_dir.join("portrait.png");
+        plot::write_png(&p.image(), &path)?;
+        timing("png file", t);
+        println!("PNG saved to {}", path.display());
+    }
+    if std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+        let t = Instant::now();
+        let (px_w, px_h, rows) = terminal_pixels().unwrap_or((800, 480, 24));
+        let usable_h = px_h as f64 * (rows.saturating_sub(2).max(1) as f64 / rows.max(1) as f64);
+        let scale = (px_w as f64 / p.width as f64).min(usable_h / p.height as f64);
+        let (w, h) = (((p.width as f64 * scale) as usize).max(1), ((p.height as f64 * scale) as usize).max(1));
+        let img = plot::resample(&p.rgb, p.width, p.height, w, h);
+        let out = sixel::encode(&img.rgba, w, h);
+        let mut stdout = std::io::stdout().lock();
+        stdout.write_all(out.as_bytes())?;
+        stdout.flush()?;
+        timing("preview", t);
+    }
+    Ok(())
+}
+
+// PNG file and terminal preview.
+#[cfg(feature = "cli")]
+fn show(args: &Args, plot: &app::PlotData<'_>, file: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let png_path = args.out_dir.join(file);
+    let stdout_is_tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
+    let render_file = || -> Result<bool, String> {
+        if args.png_scale == 0.0 {
+            return Ok(false);
+        }
+        let t = Instant::now();
+        let img = plot.render(args.png_scale as f32)?;
+        std::fs::create_dir_all(&args.out_dir).map_err(|e| format!("{}: {e}", args.out_dir.display()))?;
+        plot::write_png(&img, &png_path)?;
+        timing("png file (render + write)", t);
+        Ok(true)
+    };
+    // PNG file and terminal preview render concurrently where there are threads.
+    #[cfg(feature = "parallel")]
+    let (file_result, preview) = std::thread::scope(|scope| {
+        let file = scope.spawn(render_file);
+        let preview = if stdout_is_tty { Some(preview(plot)) } else { None };
+        (file.join().unwrap_or_else(|_| Err("PNG rendering panicked".to_string())), preview)
+    });
+    #[cfg(not(feature = "parallel"))]
+    let (file_result, preview) = (render_file(), if stdout_is_tty { Some(preview(plot)) } else { None });
+    if file_result? {
+        println!("PNG saved to {}", png_path.display());
+    }
+    match preview {
+        Some(Ok(sixel)) => {
+            let t = Instant::now();
+            let mut out = std::io::stdout().lock();
+            out.write_all(sixel.as_bytes())?;
+            out.flush()?;
+            timing("sixel write", t);
+        }
+        Some(Err(e)) => eprintln!("terminal preview failed: {e}"),
+        None => {} // not a terminal
+    }
+    Ok(())
+}
+
+fn done(args: &Args, start: Instant) {
     // background iff preview was drawn on a terminal.
     let previewed = cfg!(feature = "cli") && !args.no_display && std::io::IsTerminal::is_terminal(&std::io::stdout());
     if previewed {
@@ -418,7 +244,6 @@ fn run(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
     } else {
         println!("Done in {:.2?}", start.elapsed());
     }
-    Ok(())
 }
 
 fn main() -> ExitCode {

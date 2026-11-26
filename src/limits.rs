@@ -1,12 +1,16 @@
 use crate::error::CalcError;
 
-// Maximum expression length in bytes.
+/// Maximum expression length in bytes.
 pub const MAX_EXPR_LEN: usize = 4096;
-// Maximum parenthesis nesting depth.
+/// Maximum parenthesis nesting depth.
 pub const MAX_NESTING: usize = 128;
-// Maximum number of top level terms after simplification.
+/// Maximum number of top level terms after simplification.
 pub const MAX_TERMS: usize = 256;
+/// Maximum order of repeated sums and products. The work and memory of a build grow with the
+/// square of the order; an unbounded order from a caller (Python, the web form) could exhaust both.
+pub const MAX_ORDER: usize = 64;
 // Parser thread stack size; virtual, committed only when used.
+#[cfg(not(target_family = "wasm"))]
 pub(crate) const PARSE_STACK_BYTES: usize = 256 << 20;
 
 pub(crate) fn check_expr(expr: &str) -> Result<(), CalcError> {
@@ -28,9 +32,7 @@ pub(crate) fn check_expr(expr: &str) -> Result<(), CalcError> {
             '(' => {
                 depth += 1;
                 if depth > MAX_NESTING {
-                    return Err(CalcError::InvalidInput(format!(
-                        "parentheses nest deeper than {MAX_NESTING} levels"
-                    )));
+                    return Err(CalcError::InvalidInput(format!("parentheses nest deeper than {MAX_NESTING} levels")));
                 }
             }
             ')' => {

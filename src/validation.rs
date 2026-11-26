@@ -1,50 +1,64 @@
 use crate::abel::{AbelPlanaSum, Mode, Resonance};
 use crate::util::{is_finite, Op};
 use num_complex::Complex;
-use rayon::prelude::*;
 use std::f64::consts::{PI, TAU};
 
-// How terms are evaluated.
+/// How terms are evaluated.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum Engine {
-    // Closed forms where known, Abel-Plana for the rest.
+    /// Closed forms where known, Abel-Plana for the rest.
     #[default]
     Auto,
-    // The whole expression through Abel-Plana.
+    /// The whole expression through Abel-Plana.
     Plana,
-    // Mean only: the alternating series 2 Σ (-1)^{k-1} f(x + kS) by Euler summation (Gray 1966).
+    /// Mean only: the alternating series 2 Σ (-1)^{k-1} f(x + kS) by Euler summation (Gray 1966).
     Gray,
 }
 
-// Numerical parameters; start from Config::default().
+/// Numerical parameters; start from Config::default().
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct Config {
     pub engine: Engine,
-    // Gauss-Legendre order per panel.
+    /// Gauss-Legendre order per panel.
     pub gl_order: usize,
-    // Upper limit of the Abel-Plana tail integral, in units of the step.
+    /// Upper limit of the Abel-Plana tail integral, in units of the step.
     pub tail_y_cap: f64,
-    // Tail panels below this fraction of the running total are negligible.
+    /// Tail panels below this fraction of the running total are negligible.
     pub tail_rel_tol: f64,
-    // Required agreement of the finite-part fits at the cap and 3/4 of it, relative to the tail.
+    /// Required agreement of the finite-part fits at the cap and 3/4 of it, relative to the tail.
     pub tail_fp_tol: f64,
-    // Initial and maximal degree of the Chebyshev base interpolant.
+    /// Initial and maximal degree of the Chebyshev base interpolant.
     pub cheb_min_degree: usize,
     pub cheb_max_degree: usize,
-    // Required decay of the trailing Chebyshev coefficients.
+    /// Required decay of the trailing Chebyshev coefficients.
     pub cheb_tol: f64,
-    // Height of the region scanned for singularities during validation.
+    /// Half-height |Im z| of the region scanned for singular points during validation, and the
+    /// lowest height of the exponential-type check. Residue-sum contours grow up to this many steps
+    /// above and below the axis.
     pub contour_half_height: f64,
+    /// Highest |Im z| of the exponential-type check.
     pub decay_ymax: f64,
+    /// Heights per vertical line of the exponential-type check, geometric from
+    /// `contour_half_height` to `decay_ymax`.
     pub decay_n_points: usize,
+    /// Margin above τ/S (π/S for mean inverses) before a measured growth rate rejects a strip;
+    /// borderline types are left to the diagnosis of the Abel–Plana tail.
     pub decay_tolerance: f64,
-    // Max recurrence steps per evaluation; bounds the work for large |x|.
+    /// Max recurrence steps per evaluation; bounds the work for large |x|.
     pub max_recurrence: u64,
-    // Engine::Gray: most terms of the series, and the agreement required of t_n and t_2n.
+    /// Engine::Gray: most terms of the series, and the agreement required of t_n and t_2n.
     pub gray_max_terms: usize,
     pub gray_tol: f64,
+}
+
+impl Config {
+    // (initial, maximal) Chebyshev degree, powers of two within [4, 4096]
+    pub(crate) fn degrees(&self) -> (usize, usize) {
+        let n_min = self.cheb_min_degree.clamp(4, 4096).next_power_of_two();
+        (n_min, self.cheb_max_degree.clamp(n_min, 4096))
+    }
 }
 
 impl Default for Config {
@@ -80,7 +94,7 @@ fn strip_has_singularity<F: Fn(CF) -> CF + Sync>(f: &F, h: f64, s: f64, verbose:
     let delta = 1e-6;
     let n = 200;
     let dx = 1e-3;
-    (0..=n).into_par_iter().any(|i| {
+    crate::par::any(0..=n, |i| {
         let x = h + s * (i as f64 / n as f64);
         let fp = f(Complex::new(x, delta));
         let fm = f(Complex::new(x, -delta));
@@ -114,7 +128,7 @@ fn strip_has_pole_near_axis<F: Fn(CF) -> CF + Sync>(f: &F, h: f64, s: f64, verbo
     // z = i for 1/(z^2+1) with h = -1.4, S = 4, where x = 0.
     let n_x = 40;
     let n_y = 600; // y ∈ [-6, 6], step 0.02
-    (0..=n_x).into_par_iter().any(|i| {
+    crate::par::any(0..=n_x, |i| {
         let x = h + s * (i as f64 / n_x as f64);
         (0..=n_y).any(|j| {
             let y = -6.0 + 12.0 * j as f64 / n_y as f64;
@@ -137,7 +151,7 @@ fn strip_is_safe<F: Fn(CF) -> CF + Sync>(f: &F, h: f64, s: f64, config: &Config,
     // 120 steps on [0, 30] so y = 1 is sampled (the pole of 1/(z^2+1) at z = i
     // for h = -1.4, S = 4).
     let n_imag: i32 = 120;
-    let non_finite = (0..=n_real).into_par_iter().any(|i| {
+    let non_finite = crate::par::any(0..=n_real, |i| {
         let x = h + s * (i as f64 / n_real as f64);
         (-n_imag..=n_imag).any(|j| bad(f(Complex::new(x, m * (j as f64 / n_imag as f64)))))
     });
@@ -148,7 +162,7 @@ fn strip_is_safe<F: Fn(CF) -> CF + Sync>(f: &F, h: f64, s: f64, config: &Config,
         return false;
     }
     let delta = 1e-4;
-    let rough = (0..=n_real).into_par_iter().any(|i| {
+    let rough = crate::par::any(0..=n_real, |i| {
         let x = h + s * (i as f64 / n_real as f64);
         let fp = f(Complex::new(x, delta));
         let fm = f(Complex::new(x, -delta));
@@ -192,7 +206,10 @@ fn validate_decay<F: Fn(CF) -> CF + Sync>(
                 let rate = mag.ln() / y;
                 if rate >= limit + config.decay_tolerance {
                     if verbose {
-                        eprintln!("    [fail] exponential type ≥ {limit:.6} (rate={rate:.6} at x={x:.6}, y={:.1})", sign * y);
+                        eprintln!(
+                            "    [fail] exponential type ≥ {limit:.6} (rate={rate:.6} at x={x:.6}, y={:.1})",
+                            sign * y
+                        );
                     }
                     return Err((rate, limit));
                 }
@@ -242,7 +259,11 @@ fn check_continuity<F: Fn(CF) -> CF + Sync, G: Fn(CF) -> CF + Sync>(
         bad(v) || v.norm() >= 1e6
     };
     let n = t.abs().floor() as usize;
-    let singular = if t >= 0.0 { (0..=n).any(|k| probe(base - k as f64 * s)) } else { (1..=n).any(|k| probe(base + k as f64 * s)) };
+    let singular = if t >= 0.0 {
+        (0..=n).any(|k| probe(base - k as f64 * s))
+    } else {
+        (1..=n).any(|k| probe(base + k as f64 * s))
+    };
     if singular {
         return true;
     }
@@ -254,8 +275,16 @@ fn check_continuity<F: Fn(CF) -> CF + Sync, G: Fn(CF) -> CF + Sync>(
     if f_plus.norm() >= 1e6 || f_minus.norm() >= 1e6 {
         return true;
     }
+    // what the recurrence carries over from f itself, as at a √-type branch point of f on the path
+    let jump = |x: f64| f(Complex::new(x + epsilon, 0.0)) - f(Complex::new(x - epsilon, 0.0));
+    let zero = Complex::new(0.0, 0.0);
+    let carried = if t >= 0.0 {
+        (0..=n).fold(zero, |acc, k| acc + jump(base - k as f64 * s))
+    } else {
+        (1..=n).fold(zero, |acc, k| acc - jump(base + k as f64 * s))
+    };
     let scale = f_plus.norm().max(f_minus.norm()).max(1.0);
-    (f_plus - f_minus).norm() / scale <= 5e-3
+    (f_plus - f_minus - carried).norm() / scale <= 5e-3
 }
 
 fn validate_jump_discontinuities<F: Fn(CF) -> CF + Sync, G: Fn(CF) -> CF + Sync>(
@@ -324,6 +353,7 @@ fn validate_discrete_sums<F: Fn(CF) -> CF + Sync, G: Fn(CF) -> CF + Sync>(
 pub(crate) enum Rejection {
     Type { rate: f64, limit: f64 },
     Singular,
+    Cut,
     Tail(Resonance),
     Build(String),
     Check(&'static str),
@@ -339,7 +369,7 @@ impl Rejection {
             Rejection::Type { .. } => 3,
             Rejection::Build(_) | Rejection::Tail(Resonance::None) => 2,
             Rejection::Check(_) => 1,
-            Rejection::Singular => 0,
+            Rejection::Singular | Rejection::Cut => 0,
         }
     }
 
@@ -349,6 +379,7 @@ impl Rejection {
         matches!(
             self,
             Rejection::Singular
+                | Rejection::Cut
                 | Rejection::Check(_)
                 | Rejection::Build(_)
                 | Rejection::Tail(Resonance::None)
@@ -366,6 +397,7 @@ impl Rejection {
                 "exponential type ≈ {rate:.4} exceeds {thr} = {limit:.4}; principal solutions are not unique there"
             ),
             Rejection::Singular => "a singularity lies in or near the strip".to_string(),
+            Rejection::Cut => "the strip lies on a horizontal branch cut of f".to_string(),
             Rejection::Tail(Resonance::Tone) => format!(
                 "pure-tone resonance at {thr}: no solution of this exponential type, only secular ones such as {tone}"
             ),
@@ -381,6 +413,21 @@ impl Rejection {
             Rejection::Check(name) => format!("the {name} check failed"),
         }
     }
+}
+
+// A jump across the real axis inside the strip. Abel–Plana would take f from both sides of the cut
+// and answer for neither; ±iε rather than ±0, since arithmetic like 1 + z drops the sign of a zero.
+fn on_horizontal_cut<F: Fn(CF) -> CF>(f: &F, h: f64, s: f64) -> bool {
+    let pairs: Vec<(CF, CF)> = (0..9)
+        .map(|j| {
+            let x = h + s * (j as f64 + 0.5) / 9.0;
+            let eps = 1e-14 * x.abs().max(1.0);
+            (f(Complex::new(x, eps)), f(Complex::new(x, -eps)))
+        })
+        .filter(|&(u, d)| is_finite(u) && is_finite(d))
+        .collect();
+    let scale = pairs.iter().map(|(u, _)| u.norm()).fold(f64::MIN_POSITIVE, f64::max);
+    pairs.iter().any(|&(u, d)| (u - d).norm() > 1e-8 * scale)
 }
 
 // Validate the seed strip [h, h+S] and, on success, return the operator built on it.
@@ -404,6 +451,10 @@ where
             eprintln!("    [fail] strip validation");
         }
         return Err(Rejection::Singular);
+    }
+    // Mode::Log unwraps the logarithm along the rays instead
+    if mode == Mode::Plain && on_horizontal_cut(f, h, s) {
+        return Err(Rejection::Cut);
     }
     let op = AbelPlanaSum::build(g.clone(), sum_op, mode, h, s, config).map_err(|e| {
         if verbose {
@@ -450,7 +501,7 @@ where
 }
 
 // Hand-picked seeds, then 50 in [-30, 30] from a fixed-seed LCG (Knuth's MMIX constants).
-fn candidate_seeds() -> impl Iterator<Item = f64> {
+pub(crate) fn candidate_seeds() -> impl Iterator<Item = f64> {
     let fixed = [0.1, -0.5, 1.3, -3.4, 10.5];
     let mut seed = 12345u64;
     let random = std::iter::repeat_with(move || {
@@ -586,7 +637,8 @@ mod tests {
         let r = validate_candidate_detailed(&tone, Op::Mean, Mode::Plain, 0.1, 1.0, &cfg, false);
         assert!(matches!(r, Err(Rejection::Tail(Resonance::Tone))), "{:?}", r.err());
         let sinc = |z: CF| (z * TAU).sin() / (z * PI);
-        let op = validate_candidate_detailed(&sinc, Op::Sum, Mode::Plain, 0.1, 1.0, &cfg, false).expect("spread is accepted");
+        let op = validate_candidate_detailed(&sinc, Op::Sum, Mode::Plain, 0.1, 1.0, &cfg, false)
+            .expect("spread is accepted");
         assert_eq!(op.resonance(), Resonance::Spread);
     }
 }

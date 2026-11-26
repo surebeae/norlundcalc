@@ -19,13 +19,10 @@ pub(crate) fn encode(rgba: &[u8], width: usize, height: usize) -> String {
     let mut idx = vec![0u16; width * height];
     let mut count = vec![0u32; BUCKETS];
     let mut sum = vec![[0u64; 3]; BUCKETS];
-    for (i, px) in rgba.chunks_exact(4).enumerate() {
+    for (i, px) in rgba.as_chunks::<4>().0.iter().enumerate() {
         let a = px[3] as u32;
-        let (r, g, b) = (
-            (px[0] as u32 * a / 255) as u8,
-            (px[1] as u32 * a / 255) as u8,
-            (px[2] as u32 * a / 255) as u8,
-        );
+        let (r, g, b) =
+            ((px[0] as u32 * a / 255) as u8, (px[1] as u32 * a / 255) as u8, (px[2] as u32 * a / 255) as u8);
         let k = bucket(r, g, b);
         idx[i] = k as u16;
         count[k] += 1;
@@ -223,6 +220,7 @@ mod tests {
         let mut want = Vec::new();
         for y in 0..h {
             for x in 0..w {
+                #[rustfmt::skip]
                 let c = if y == 5 { 1 } else if x == 7 || x == 8 { 2 } else if (x + y) % 11 == 0 { 3 } else { 0 };
                 want.push(c);
                 rgba.extend_from_slice(&colors[c]);
@@ -252,7 +250,7 @@ mod tests {
             }
         }
         let distinct: std::collections::HashSet<usize> =
-            rgba.chunks_exact(4).map(|p| bucket(p[0], p[1], p[2])).collect();
+            rgba.as_chunks::<4>().0.iter().map(|p| bucket(p[0], p[1], p[2])).collect();
         assert!(distinct.len() > MAX_COLORS);
         let s = encode(&rgba, w, h);
         let (_, img) = decode(&s, w, h);

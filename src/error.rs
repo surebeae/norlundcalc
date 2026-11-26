@@ -3,11 +3,16 @@ use std::fmt;
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum CalcError {
+    /// No solution could be built; the message says why.
     BuildFailed(String),
+    /// The point is a singular point of the solution.
     NonFinite,
     InvalidInput(String),
-    // x is farther from the seed strip than the recurrence limit allows.
-    OutOfRange { x: f64, domain: (f64, f64) },
+    /// x is farther from the seed strip than the recurrence limit allows.
+    OutOfRange {
+        x: f64,
+        domain: (f64, f64),
+    },
 }
 
 impl fmt::Display for CalcError {

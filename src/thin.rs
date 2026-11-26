@@ -9,6 +9,7 @@
 // Σ_β P_β is the contour integral of f·kernel around the rectangle between the cuts, less the
 // kernel's own residues at x + jS (and at x0 + jS for the sum kernel, normalised at x0).
 
+use crate::cheb;
 use crate::quadrature::{gauss_legendre, GaussRule};
 use crate::util::{is_finite, KahanSum, Op, NAN};
 use crate::validation::Config;
@@ -61,16 +62,24 @@ impl<F> StripShift<F>
 where
     F: Fn(CF) -> CF + Send + Sync,
 {
-    // Ok(None) if the target line lies in the seed strip.
-    pub(crate) fn new(f: F, op: Op, s: f64, target: f64, seed_lo: f64, config: &Config) -> Result<Option<Self>, String> {
+    // Ok(None) if the target line lies in the closed seed strip, which validation found free of
+    // singular points edges included: its maximal strip is the seed's own.
+    pub(crate) fn new(
+        f: F,
+        op: Op,
+        s: f64,
+        target: f64,
+        seed_lo: f64,
+        config: &Config,
+    ) -> Result<Option<Self>, String> {
         if !(target.is_finite() && seed_lo.is_finite() && s.is_finite() && s > 0.0) {
             return Err("non-finite strip parameters".to_string());
         }
         let seed_hi = seed_lo + s;
-        if target > seed_lo && target < seed_hi {
+        if target >= seed_lo && target <= seed_hi {
             return Ok(None);
         }
-        let (sign, gap) = if target >= seed_hi { (1.0, target - seed_hi) } else { (-1.0, seed_lo - target) };
+        let (sign, gap) = if target > seed_hi { (1.0, target - seed_hi) } else { (-1.0, seed_lo - target) };
         let mut scale: f64 = 1.0;
         for &c in &[target, seed_lo + 0.5 * s] {
             for &y in &[-0.7 * s, -0.3 * s, 0.3 * s, 0.7 * s] {
@@ -108,7 +117,7 @@ where
             }
             let ok = [(target - band, target), (target, target + band)].iter().all(|&(lo, hi)| {
                 tests.iter().all(|&x| {
-                    let v = shift.residue_sum(x, lo, hi);
+                    let v = shift.residue_sum(Complex::new(x, 0.0), lo, hi, shift.height);
                     is_finite(v) && v.norm() <= 1e-9 * shift.scale
                 })
             });
@@ -133,9 +142,14 @@ where
         if !(is_finite(p1) && is_finite(p2)) || (p2 - parity * p1).norm() > tol {
             return Err("the residue-sum correction failed its periodicity check".to_string());
         }
-        let alt = shift.correction_with(x1, Some(target - 0.6 * band), None) - shift.correction_with(x1, Some(target + 0.6 * band), None);
+        let z1 = Complex::new(x1, 0.0);
+        let alt = shift.correction_with(z1, Some(target - 0.6 * band), None)
+            - shift.correction_with(z1, Some(target + 0.6 * band), None);
         if !is_finite(alt) || alt.norm() > tol {
-            return Err("the residue-sum correction depends on the contour position; a singular point may lie near the line".to_string());
+            return Err(
+                "the residue-sum correction depends on the contour position; a singular point may lie near the line"
+                    .to_string(),
+            );
         }
         Ok(Some(shift))
     }
@@ -182,7 +196,8 @@ where
     // f(x0 + jS) enter as explicit residue terms that cancel only in the constant: keep |f| small.
     fn choose_x0(&self) -> f64 {
         let s = self.s;
-        let (lo, hi) = if self.sign > 0.0 { (self.seed_lo, self.target + s) } else { (self.target - s, self.seed_lo + s) };
+        let (lo, hi) =
+            if self.sign > 0.0 { (self.seed_lo, self.target + s) } else { (self.target - s, self.seed_lo + s) };
         let worst = |x0: f64| -> f64 {
             let j_lo = ((lo - x0) / s).floor() as i64;
             let j_hi = ((hi - x0) / s).ceil() as i64;
@@ -201,11 +216,17 @@ where
     // and take f from the wrong side; the window keeps F(x) - F(x - S) = f(x) with f's real-axis
     // values.
     pub(crate) fn correction(&self, x: f64) -> CF {
-        if !x.is_finite() {
+        self.correction_complex(Complex::new(x, 0.0))
+    }
+
+    // Off the axis the rectangle grows by |Im z|, so that the band of singular points around the
+    // height of z, which no longer cancels, lies inside it.
+    pub(crate) fn correction_complex(&self, z: CF) -> CF {
+        if !(z.re.is_finite() && z.im.is_finite()) {
             return NAN;
         }
-        let n = ((x - (self.target - 0.5 * self.s)) / self.s).floor();
-        let v = self.correction_with(x - n * self.s, None, None);
+        let n = ((z.re - (self.target - 0.5 * self.s)) / self.s).floor();
+        let v = self.correction_with(z - n * self.s, None, None);
         if self.op == Op::Mean && n.rem_euclid(2.0) == 1.0 {
             -v
         } else {
@@ -213,14 +234,46 @@ where
         }
     }
 
+    // The correction on the row Im z = y: one Chebyshev series over the window around the target,
+    // repeated with period S; each point gets its own residue sum where the series does not converge.
+    pub(crate) fn correction_row(&self, y: f64, xs: &[f64], config: &Config) -> Vec<CF> {
+        let s = self.s;
+        let lo = self.target - 0.5 * s;
+        // periodic and cheap to test at low degree; each sample is a contour integral
+        let (n_min, n_max) = config.degrees();
+        let n_min = n_min.min(16);
+        let at = |x: f64| self.correction_with(Complex::new(x, y), None, None);
+        let fitted = if y.is_finite() {
+            cheb::fit(lo, lo + s, n_min, n_max, config.cheb_tol, |x| Some(vec![at(x)]).filter(|v| is_finite(v[0])))
+                .and_then(|mut v| v.pop())
+        } else {
+            None
+        };
+        xs.iter()
+            .map(|&x| {
+                if !(x.is_finite() && y.is_finite()) {
+                    return NAN;
+                }
+                let n = ((x - lo) / s).floor();
+                let xr = x - n * s;
+                let v = fitted.as_ref().map_or_else(|| at(xr), |c| c.eval(xr));
+                if self.op == Op::Mean && n.rem_euclid(2.0) == 1.0 {
+                    -v
+                } else {
+                    v
+                }
+            })
+            .collect()
+    }
+
     // sides fixed for the construction checks
-    fn correction_with(&self, x: f64, target_side: Option<f64>, seed_side: Option<f64>) -> CF {
-        if !x.is_finite() {
+    fn correction_with(&self, z: CF, target_side: Option<f64>, seed_side: Option<f64>) -> CF {
+        if !(z.re.is_finite() && z.im.is_finite()) {
             return NAN;
         }
         let s = self.s;
         let avoid = |c: f64| {
-            let d = lattice_dist(c, x, s);
+            let d = lattice_dist(c, z.re, s);
             match self.op {
                 Op::Sum => d.min(lattice_dist(c, self.x0, s)),
                 Op::Mean => d,
@@ -235,15 +288,15 @@ where
         let ct = target_side.unwrap_or_else(|| best(self.target - self.band, self.target + self.band));
         let cs = seed_side.unwrap_or_else(|| best(self.seed_lo + 0.05 * s, self.seed_lo + 0.95 * s));
         let (lo, hi) = if ct < cs { (ct, cs) } else { (cs, ct) };
-        self.sign * self.residue_sum(x, lo, hi)
+        self.sign * self.residue_sum(z, lo, hi, self.height + z.im.abs())
     }
 
-    // Σ P_β over lo < Re β < hi, |Im β| < height
-    fn residue_sum(&self, x: f64, lo: f64, hi: f64) -> CF {
+    // Σ P_β over lo < Re β < hi, |Im β| < y
+    fn residue_sum(&self, x: CF, lo: f64, hi: f64, y: f64) -> CF {
         let s = self.s;
         let (op, x0) = (self.op, self.x0);
         let kernel = move |z: CF| -> CF {
-            let w = (Complex::new(x, 0.0) - z) * (PI / s);
+            let w = (x - z) * (PI / s);
             match op {
                 // cot a - cot b = sin(b - a) csc a csc b, without cancellation far from the axis
                 Op::Sum => {
@@ -254,7 +307,6 @@ where
             }
         };
         let g = |z: CF| (self.f)(z) * kernel(z);
-        let y = self.height;
         // ∮ = ∫_lo^hi [g(u - iY) - g(u + iY)] du + i ∫_{-Y}^{Y} [g(hi + it) - g(lo + it)] dt
         let horiz = self.integrate(lo, hi, |u| g(Complex::new(u, -y)) - g(Complex::new(u, y)));
         let vert = self.integrate(-y, y, |t| g(Complex::new(hi, t)) - g(Complex::new(lo, t)));
@@ -262,10 +314,10 @@ where
         let mut acc = KahanSum::default();
         acc.add(-contour / (TAU * I));
         // kernel residues
-        let j_lo = ((lo - x) / s).ceil() as i64;
-        let j_hi = ((hi - x) / s).floor() as i64;
+        let j_lo = ((lo - x.re) / s).ceil() as i64;
+        let j_hi = ((hi - x.re) / s).floor() as i64;
         for j in j_lo..=j_hi {
-            let v = (self.f)(Complex::new(x + j as f64 * s, 0.0));
+            let v = (self.f)(x + j as f64 * s);
             acc.add(match op {
                 Op::Sum => -v,
                 Op::Mean => -2.0 * if j.rem_euclid(2) == 0 { 1.0 } else { -1.0 } * v,
@@ -342,6 +394,39 @@ mod tests {
     }
 
     #[test]
+    fn inner_strip_at_complex_points() {
+        use crate::abel::tests::digamma_c;
+        let f = |z: CF| c(1.0) / z + c(1.0) / (z - c(0.5));
+        let cfg = Config::default();
+        let base = validate_candidate(&f, Op::Sum, Mode::Plain, 1.3, 1.0, &cfg, false).unwrap();
+        let shift = StripShift::new(f, Op::Sum, 1.0, 0.25, 1.3, &cfg).unwrap().unwrap();
+        let raw = |z: CF| base.eval_complex(z) + shift.correction_complex(z);
+        let exact = |z: CF| digamma_c(z + c(1.0)) + digamma_c(c(0.5) - z);
+        let z0 = c(0.2);
+        for z in [Complex::new(0.25, 0.6), Complex::new(0.1, -1.4), Complex::new(2.6, 0.3), Complex::new(-1.7, 2.2)] {
+            let (got, want) = (raw(z) - raw(z0), exact(z) - exact(z0));
+            assert!((got - want).norm() < 1e-10 * want.norm().max(1.0), "z={z}: {got} vs {want}");
+        }
+    }
+
+    #[test]
+    fn rows_of_the_correction() {
+        let f = |z: CF| c(1.0) / z + c(1.0) / (z - c(0.5));
+        let cfg = Config::default();
+        let xs: Vec<f64> = (0..40).map(|k| -2.9 + 0.173 * k as f64).collect();
+        for (op, seed) in [(Op::Sum, 1.3), (Op::Mean, 1.3)] {
+            let shift = StripShift::new(f, op, 1.0, 0.25, seed, &cfg).unwrap().unwrap();
+            for y in [0.0, 0.6, -1.4, 2.2] {
+                let row = shift.correction_row(y, &xs, &cfg);
+                for (&x, v) in xs.iter().zip(&row) {
+                    let want = shift.correction_complex(Complex::new(x, y));
+                    assert!((*v - want).norm() < 1e-11 * want.norm().max(1.0), "{op:?} x={x} y={y}: {v} vs {want}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn non_unit_step() {
         // (1/S) ψ((x - 0.2)/S + 1) + (1/S) ψ((0.5 - x)/S) + const
         let s = 0.7;
@@ -383,6 +468,16 @@ mod tests {
     fn target_in_seed_strip_needs_no_correction() {
         let f = |z: CF| c(1.0) / (z * z + c(1.0));
         assert!(StripShift::new(f, Op::Sum, 1.0, 1.7, 1.3, &Config::default()).unwrap().is_none());
+    }
+
+    // 0.1 + 1.0 == 1.1: a line on the edge of a valid seed strip once failed the band check, with
+    // no room for a band, and was reported as passing through a singular point.
+    #[test]
+    fn target_on_the_seed_edge_needs_no_correction() {
+        let f = |z: CF| c(1.0) / (z - c(1.6));
+        let cfg = Config::default();
+        assert!(StripShift::new(f, Op::Sum, 1.0, 0.1 + 1.0, 0.1, &cfg).unwrap().is_none());
+        assert!(StripShift::new(f, Op::Sum, 1.0, 0.1, 0.1, &cfg).unwrap().is_none());
     }
 
     #[test]

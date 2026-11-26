@@ -1,9 +1,8 @@
-use crate::cheb::{lobatto_point, Chebyshev};
+use crate::cheb::{self, lobatto_point, Chebyshev};
 use crate::quadrature::{gauss_legendre, GaussRule};
 use crate::util::{is_finite, KahanSum, Op, NAN};
 use crate::validation::Config;
 use num_complex::Complex;
-use rayon::prelude::*;
 use std::f64::consts::{PI, TAU};
 
 const I: Complex<f64> = Complex::new(0.0, 1.0);
@@ -17,7 +16,7 @@ pub(crate) enum Mode {
 
 // new + τik with k chosen so the imaginary part is within π of prev.
 #[inline]
-fn unwrap_log(prev: Complex<f64>, new: Complex<f64>) -> Complex<f64> {
+pub(crate) fn unwrap_log(prev: Complex<f64>, new: Complex<f64>) -> Complex<f64> {
     let k = ((prev.im - new.im) / TAU).round();
     Complex::new(new.re, new.im + TAU * k)
 }
@@ -49,11 +48,11 @@ fn base_without_integral<G: Fn(Complex<f64>) -> Complex<f64>>(
     u: &G,
     op: Op,
     mode: Mode,
-    w: f64,
+    w: Complex<f64>,
     rule: &GaussRule,
     config: &Config,
 ) -> (Complex<f64>, Tail) {
-    let uw = u(Complex::new(w, 0.0));
+    let uw = u(w);
     let mut tail = tail_integral(u, op, mode, w, uw, rule, config);
     let own = match op {
         Op::Sum => -0.5 * uw,
@@ -72,8 +71,8 @@ fn kernel(op: Op, t: f64) -> f64 {
 }
 
 #[inline]
-fn plain_integrand<G: Fn(Complex<f64>) -> Complex<f64>>(u: &G, op: Op, w: f64, t: f64) -> Complex<f64> {
-    (u(Complex::new(w, t)) - u(Complex::new(w, -t))) / kernel(op, t)
+fn plain_integrand<G: Fn(Complex<f64>) -> Complex<f64>>(u: &G, op: Op, w: Complex<f64>, t: f64) -> Complex<f64> {
+    (u(w + Complex::new(0.0, t)) - u(w - Complex::new(0.0, t))) / kernel(op, t)
 }
 
 // ∫_0^∞ [u(w+it) - u(w-it)] k(t) dt, k = 1/(e^{τt} - 1) (sum) or 1/sinh(πt) (mean).
@@ -83,15 +82,15 @@ fn tail_integral<G: Fn(Complex<f64>) -> Complex<f64>>(
     u: &G,
     op: Op,
     mode: Mode,
-    w: f64,
+    w: Complex<f64>,
     uw: Complex<f64>,
     rule: &GaussRule,
     config: &Config,
 ) -> Tail {
     let (mut prev_up, mut prev_dn) = (uw, uw);
     let mut integrand = |t: f64| -> Complex<f64> {
-        let mut up = u(Complex::new(w, t));
-        let mut dn = u(Complex::new(w, -t));
+        let mut up = u(w + Complex::new(0.0, t));
+        let mut dn = u(w - Complex::new(0.0, t));
         if mode == Mode::Log {
             up = unwrap_log(prev_up, up);
             dn = unwrap_log(prev_dn, dn);
@@ -149,7 +148,7 @@ fn tail_integral<G: Fn(Complex<f64>) -> Complex<f64>>(
 fn diagnose_tail<G: Fn(Complex<f64>) -> Complex<f64>>(
     u: &G,
     op: Op,
-    w: f64,
+    w: Complex<f64>,
     y: f64,
     total_y: Complex<f64>,
     (y_b, total_b): (f64, Complex<f64>),
@@ -172,9 +171,9 @@ fn diagnose_tail<G: Fn(Complex<f64>) -> Complex<f64>>(
 
     let mut err = f64::INFINITY;
     // short window: faster in 1/t (seeds far from 0); long: less rounding noise (near-threshold)
-    let pair = |sigma_max: f64| match (finite_part(&g, total_y, y, sigma_max), finite_part(&g, total_b, y_b, sigma_max)) {
-        (Some(a), Some(b)) => Some(((a.value - b.value).norm(), a)),
-        _ => None,
+    let pair = |sigma_max: f64| {
+        let (a, b) = (finite_part(&g, total_y, y, sigma_max)?, finite_part(&g, total_b, y_b, sigma_max)?);
+        Some(((a.value - b.value).norm(), a))
     };
     let best = [2.0, 3.0].iter().filter_map(|&m| pair(m)).min_by(|p, q| p.0.total_cmp(&q.0));
     if let Some((e, a)) = best {
@@ -190,7 +189,11 @@ fn diagnose_tail<G: Fn(Complex<f64>) -> Complex<f64>>(
         }
     }
     let kind = if flat {
-        if r2 > 0.2 && r2 > 1.5 * r1 + 0.2 { Resonance::Exponential } else { Resonance::Tone }
+        if r2 > 0.2 && r2 > 1.5 * r1 + 0.2 {
+            Resonance::Exponential
+        } else {
+            Resonance::Tone
+        }
     } else if r2 < 1.5 * r1 - 0.2 || p <= -1.3 {
         Resonance::None // decays, but not within the cap
     } else {
@@ -228,7 +231,7 @@ struct FinitePart {
     size: f64,
 }
 
-// With t·g(t) ≈ c_lin·t + Σ_{0<=k<K-1} c_k t^{-k} on [y/sigma_max, y],
+// With t·g(t) ≈ c_lin·t + Σ_{0≤k<K-1} c_k t^{-k} on [y/sigma_max, y],
 // FP = ∫_0^y g - c_lin·y - c_0 ln y + Σ_{k≥1} c_k y^{-k}/k. c_lin absorbs e^{-εt} from a spectrum
 // edge just inside the threshold (6.2831853 for τ).
 fn finite_part<G: Fn(f64) -> Complex<f64>>(g: &G, total: Complex<f64>, y: f64, sigma_max: f64) -> Option<FinitePart> {
@@ -288,11 +291,13 @@ fn solve<const K: usize>(mut a: [[Complex<f64>; K]; K], mut b: [Complex<f64>; K]
 pub struct AbelPlanaSum<F: Fn(Complex<f64>) -> Complex<f64> + Sync> {
     f: F,
     op: Op,
+    mode: Mode,
     h: f64,
     s: f64,
     base: Chebyshev,
     c: Complex<f64>,
     max_recurrence: u64,
+    config: Config,
     converged: bool,
     resonance: Resonance,
     tail_error: f64,
@@ -312,27 +317,25 @@ impl<F: Fn(Complex<f64>) -> Complex<f64> + Sync> AbelPlanaSum<F> {
         let rule = gauss_legendre(config.gl_order);
         let u = |w: Complex<f64>| f(Complex::new(s * w.re + h, s * w.im));
 
-        let n_min = config.cheb_min_degree.clamp(4, 4096).next_power_of_two();
-        let n_max = config.cheb_max_degree.clamp(n_min, 4096);
+        let (n_min, n_max) = config.degrees();
 
         // Base values minus ∫_0^w u, on the Lobatto grid.
         let mut n = n_min;
-        let mut partial: Vec<(Complex<f64>, Tail)> = (0..=n)
-            .into_par_iter()
-            .map(|j| base_without_integral(&u, op, mode, lobatto_point(n, j, 0.0, 1.0), &rule, config))
-            .collect();
+        let mut partial: Vec<(Complex<f64>, Tail)> = crate::par::map(0..=n, |j| {
+            base_without_integral(&u, op, mode, Complex::new(lobatto_point(n, j, 0.0, 1.0), 0.0), &rule, config)
+        });
 
         let (base, cheb_ok) = loop {
             // Sum: add the cumulative ∫_0^{w_j} u, one Gauss panel per grid gap.
             let mut cum = KahanSum::default();
             let mut values = Vec::with_capacity(n + 1);
             values.push(partial[0].0);
-            for j in 1..=n {
+            for (j, (b, _)) in partial.iter().enumerate().skip(1) {
                 if op == Op::Sum {
-                    let (a, b) = (lobatto_point(n, j - 1, 0.0, 1.0), lobatto_point(n, j, 0.0, 1.0));
-                    cum.add(rule.integrate(a, b, |x| u(Complex::new(x, 0.0))));
+                    let (lo, hi) = (lobatto_point(n, j - 1, 0.0, 1.0), lobatto_point(n, j, 0.0, 1.0));
+                    cum.add(rule.integrate(lo, hi, |x| u(Complex::new(x, 0.0))));
                 }
-                values.push(partial[j].0 + cum.total());
+                values.push(*b + cum.total());
             }
             if !values.iter().all(|v| is_finite(*v)) {
                 return Err("non-finite value while building the base function".to_string());
@@ -352,10 +355,10 @@ impl<F: Fn(Complex<f64>) -> Complex<f64> + Sync> AbelPlanaSum<F> {
 
             // The n grid is the even points of the 2n grid.
             let n2 = 2 * n;
-            let fresh: Vec<(Complex<f64>, Tail)> = (0..n)
-                .into_par_iter()
-                .map(|k| base_without_integral(&u, op, mode, lobatto_point(n2, 2 * k + 1, 0.0, 1.0), &rule, config))
-                .collect();
+            let fresh: Vec<(Complex<f64>, Tail)> = crate::par::map(0..n, |k| {
+                let w = Complex::new(lobatto_point(n2, 2 * k + 1, 0.0, 1.0), 0.0);
+                base_without_integral(&u, op, mode, w, &rule, config)
+            });
             let mut merged = Vec::with_capacity(n2 + 1);
             for k in 0..n {
                 merged.push(partial[k]);
@@ -382,11 +385,13 @@ impl<F: Fn(Complex<f64>) -> Complex<f64> + Sync> AbelPlanaSum<F> {
         Ok(AbelPlanaSum {
             f,
             op,
+            mode,
             h,
             s,
             base,
             c,
             max_recurrence,
+            config: config.clone(),
             converged: cheb_ok && tail_ok,
             resonance,
             tail_error,
@@ -401,6 +406,73 @@ impl<F: Fn(Complex<f64>) -> Complex<f64> + Sync> AbelPlanaSum<F> {
             .unwrap_or(NAN)
     }
 
+    // Off the axis the base is the Abel–Plana formula itself, evaluated at the complex point; the
+    // recurrence then runs along the horizontal line through z.
+    pub fn eval_complex(&self, z: Complex<f64>) -> Complex<f64> {
+        if z.im == 0.0 {
+            return self.eval_raw(z.re);
+        }
+        let Some((t, n, r)) = lattice(self.h, self.s, self.max_recurrence, z.re) else {
+            return NAN;
+        };
+        let (h, s) = (self.h, self.s);
+        let y = z.im / s;
+        let u = |w: Complex<f64>| (self.f)(Complex::new(s * w.re + h, s * w.im));
+        let Some(b) = self.base_at(&u, Complex::new(r, y)) else {
+            return NAN;
+        };
+        let line = |v: f64| u(Complex::new(v, y));
+        recur(self.op, &line, b, t, n, r).map(|v| v - self.c).unwrap_or(NAN)
+    }
+
+    // Values on the row Im z = y. The base along the row is one Chebyshev series in Re over the seed
+    // strip; where that series does not converge each point gets its own base.
+    pub fn eval_row(&self, y: f64, xs: &[f64]) -> Vec<Complex<f64>> {
+        if y == 0.0 {
+            return xs.iter().map(|&x| self.eval_raw(x)).collect();
+        }
+        let (h, s) = (self.h, self.s);
+        let y = y / s;
+        let u = |w: Complex<f64>| (self.f)(Complex::new(s * w.re + h, s * w.im));
+        let cfg = &self.config;
+        let (n_min, n_max) = cfg.degrees();
+        let fitted =
+            cheb::fit(0.0, 1.0, n_min, n_max, cfg.cheb_tol, |r| self.base_at(&u, Complex::new(r, y)).map(|b| vec![b]));
+        let base = fitted.and_then(|mut v| v.pop());
+        let line = |v: f64| u(Complex::new(v, y));
+        xs.iter()
+            .map(|&x| {
+                let Some((t, n, r)) = lattice(h, s, self.max_recurrence, x) else {
+                    return NAN;
+                };
+                let b = match &base {
+                    Some(c) => c.eval(r),
+                    None => match self.base_at(&u, Complex::new(r, y)) {
+                        Some(b) => b,
+                        None => return NAN,
+                    },
+                };
+                recur(self.op, &line, b, t, n, r).map(|v| v - self.c).unwrap_or(NAN)
+            })
+            .collect()
+    }
+
+    // Base at a complex point w of the scaled strip: the Chebyshev base continued off the axis.
+    fn base_at<U: Fn(Complex<f64>) -> Complex<f64>>(&self, u: &U, w: Complex<f64>) -> Option<Complex<f64>> {
+        let rule = gauss_legendre(self.config.gl_order);
+        let (b, tail) = base_without_integral(u, self.op, self.mode, w, &rule, &self.config);
+        if !tail.ok || !is_finite(b) {
+            return None;
+        }
+        if self.op == Op::Mean {
+            return Some(b);
+        }
+        // ∫_0^w u along 0 → Re w → w
+        let along = rule.integrate_panels(0.0, w.re, panels(w.re), |x| u(Complex::new(x, 0.0)));
+        let up = rule.integrate_panels(0.0, w.im, panels(w.im), |y| u(Complex::new(w.re, y)));
+        Some(b + along + I * up)
+    }
+
     // The operator applied to the solution at x: F(x) - F(x - S), or (G(x) + G(x - S))/2.
     pub(crate) fn apply(&self, x: f64) -> Complex<f64> {
         let (now, prev) = (self.eval_raw(x), self.eval_raw(x - self.s));
@@ -410,11 +482,20 @@ impl<F: Fn(Complex<f64>) -> Complex<f64> + Sync> AbelPlanaSum<F> {
         }
     }
 
+    pub(crate) fn config(&self) -> &Config {
+        &self.config
+    }
+
     pub(crate) fn op(&self) -> Op {
         self.op
     }
 
-    // Seed point of the strip [h, h + S].
+    // The summand as given to build.
+    pub(crate) fn function(&self) -> &F {
+        &self.f
+    }
+
+    // Left edge of the seed strip [h, h + S].
     pub fn h(&self) -> f64 {
         self.h
     }
@@ -432,7 +513,8 @@ impl<F: Fn(Complex<f64>) -> Complex<f64> + Sync> AbelPlanaSum<F> {
         self.tails_ok
     }
 
-    // 0 if every tail converged, inf if one failed
+    // Largest tail error estimate on the grid: 0 where the panels converged, the disagreement of
+    // two finite-part fits where the tail was extrapolated, inf where it failed.
     pub fn tail_error(&self) -> f64 {
         self.tail_error
     }
@@ -450,6 +532,26 @@ impl<F: Fn(Complex<f64>) -> Complex<f64> + Sync> AbelPlanaSum<F> {
     }
 }
 
+// Panels of width at most 1/4 on [0, len].
+fn panels(len: f64) -> usize {
+    (4.0 * len.abs()).ceil().max(1.0) as usize
+}
+
+// x = h + S·t, t = n + r with r ∈ [0, 1).
+pub(crate) fn lattice(h: f64, s: f64, max_recurrence: u64, x: f64) -> Option<(f64, i64, f64)> {
+    if !x.is_finite() {
+        return None;
+    }
+    let t = (x - h) / s;
+    if !t.is_finite() || t.abs() > max_recurrence as f64 {
+        return None;
+    }
+    // lattice points that rounding puts just below an integer take the strip's left edge
+    let fl = (t + 1e-12).floor();
+    // |t| <= max_recurrence, so this is exact
+    Some((t, fl as i64, t - fl))
+}
+
 fn raw_eval<F: Fn(Complex<f64>) -> Complex<f64>>(
     f: &F,
     op: Op,
@@ -459,22 +561,16 @@ fn raw_eval<F: Fn(Complex<f64>) -> Complex<f64>>(
     max_recurrence: u64,
     x: f64,
 ) -> Option<Complex<f64>> {
-    if !x.is_finite() {
-        return None;
-    }
-    let t = (x - h) / s;
-    if !t.is_finite() || t.abs() > max_recurrence as f64 {
-        return None;
-    }
-    let eps = 1e-12;
-    let fl = (t + eps).floor();
-    let n = fl as i64; // |t| <= max_recurrence, so this is exact
-    let r = t - fl;
+    let (t, n, r) = lattice(h, s, max_recurrence, x)?;
     let u = |v: f64| f(Complex::new(s * v + h, 0.0));
-    if op == Op::Mean {
-        return mean_recurrence(&u, base, t, n, r);
-    }
+    recur(op, &u, base.eval(r), t, n, r)
+}
 
+// The solution at t from the base value b at r = t - n (b = F(r - 1) for the sum, G(r) for the mean).
+fn recur<U: Fn(f64) -> Complex<f64>>(op: Op, u: &U, b: Complex<f64>, t: f64, n: i64, r: f64) -> Option<Complex<f64>> {
+    if op == Op::Mean {
+        return mean_recurrence(u, b, t, n, r);
+    }
     let mut acc = KahanSum::default();
     if n >= 0 {
         for k in 0..=n {
@@ -484,7 +580,7 @@ fn raw_eval<F: Fn(Complex<f64>) -> Complex<f64>>(
             }
             acc.add(term);
         }
-        acc.add(base.eval(r));
+        acc.add(b);
         Some(acc.total())
     } else {
         for k in 1..=(-n) {
@@ -494,7 +590,7 @@ fn raw_eval<F: Fn(Complex<f64>) -> Complex<f64>>(
             }
             acc.add(-term);
         }
-        acc.add(base.eval(r));
+        acc.add(b);
         acc.add(u(r));
         Some(acc.total())
     }
@@ -502,7 +598,7 @@ fn raw_eval<F: Fn(Complex<f64>) -> Complex<f64>>(
 
 // G(y + nS) = (-1)^n G(y) + 2 Σ_{k=1}^{n} (-1)^{n-k} f(y + kS),
 // G(y - mS) = (-1)^m G(y) + 2 Σ_{j=0}^{m-1} (-1)^{m-1-j} f(y - jS),  y = h + rS.
-fn mean_recurrence<U: Fn(f64) -> Complex<f64>>(u: &U, base: &Chebyshev, t: f64, n: i64, r: f64) -> Option<Complex<f64>> {
+fn mean_recurrence<U: Fn(f64) -> Complex<f64>>(u: &U, b: Complex<f64>, t: f64, n: i64, r: f64) -> Option<Complex<f64>> {
     let parity = |k: i64| if k % 2 == 0 { 1.0 } else { -1.0 };
     let mut acc = KahanSum::default();
     if n >= 0 {
@@ -523,12 +619,12 @@ fn mean_recurrence<U: Fn(f64) -> Complex<f64>>(u: &U, base: &Chebyshev, t: f64, 
             acc.add(2.0 * parity(m - 1 - j) * term);
         }
     }
-    acc.add(parity(n) * base.eval(r));
+    acc.add(parity(n) * b);
     Some(acc.total())
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn check_difference_equation<F>(f: F, h: f64, s: f64, xs: &[f64], tol: f64)
@@ -749,7 +845,12 @@ mod tests {
             .map(|&h| AbelPlanaSum::build(f, Op::Sum, Mode::Plain, h, 1.0, &Config::default()).unwrap())
             .collect();
         for op in &ops {
-            assert!(op.converged() && op.resonance() == Resonance::Spread, "{:?} {:.1e}", op.resonance(), op.tail_error());
+            assert!(
+                op.converged() && op.resonance() == Resonance::Spread,
+                "{:?} {:.1e}",
+                op.resonance(),
+                op.tail_error()
+            );
         }
         let d0 = ops[1].eval_raw(0.5) - ops[0].eval_raw(0.5);
         for &x in &[-2.3, 0.7, 2.6] {
@@ -763,5 +864,76 @@ mod tests {
         let op = AbelPlanaSum::new(f, 1.3, 1.0, &Config::default()).unwrap();
         assert!(!op.converged());
         assert_eq!(op.resonance(), Resonance::Tone);
+    }
+
+    // ψ by recurrence up to Re z ≥ 10, then the asymptotic series.
+    pub(crate) fn digamma_c(mut z: Complex<f64>) -> Complex<f64> {
+        let mut acc = Complex::new(0.0, 0.0);
+        while z.re < 10.0 {
+            acc -= 1.0 / z;
+            z += Complex::new(1.0, 0.0);
+        }
+        let z2 = 1.0 / (z * z);
+        let b = [1.0 / 12.0, -1.0 / 120.0, 1.0 / 252.0, -1.0 / 240.0, 1.0 / 132.0, -691.0 / 32760.0, 1.0 / 12.0];
+        let mut series = Complex::new(0.0, 0.0);
+        let mut p = z2;
+        for bk in b {
+            series += bk * p;
+            p *= z2;
+        }
+        acc + z.ln() - 0.5 / z - series
+    }
+
+    #[test]
+    fn complex_points_off_the_axis() {
+        // 1/(z² + 1) = (1/2i)(1/(z - i) - 1/(z + i)): F = (1/2i)(ψ(z + 1 - i) - ψ(z + 1 + i))
+        let f = |z: Complex<f64>| c(1.0) / (z * z + c(1.0));
+        let i = Complex::new(0.0, 1.0);
+        let exact = |z: Complex<f64>| (digamma_c(z + c(1.0) - i) - digamma_c(z + c(1.0) + i)) / (2.0 * i);
+        let op = AbelPlanaSum::new(f, 1.0, 1.0, &Config::default()).unwrap();
+        let z0 = Complex::new(1.4, 0.0);
+        for z in [Complex::new(0.3, 0.7), Complex::new(2.5, -1.2), Complex::new(-0.5, 2.0), Complex::new(5.2, 0.4)] {
+            let got = op.eval_complex(z) - op.eval_complex(z0);
+            let want = exact(z) - exact(z0);
+            assert!((got - want).norm() < 1e-11, "z={z}: {got} vs {want}");
+            let step = op.eval_complex(z) - op.eval_complex(z - c(1.0)) - f(z);
+            assert!(step.norm() < 1e-11, "difference equation at {z}: {step}");
+        }
+        // continuous across the axis
+        let near = op.eval_complex(Complex::new(1.7, 1e-9)) - op.eval_raw(1.7);
+        assert!(near.norm() < 1e-8, "{near}");
+    }
+
+    #[test]
+    fn rows_match_single_points() {
+        let f = |z: Complex<f64>| c(1.0) / (z * z + c(1.0));
+        let sum = AbelPlanaSum::new(f, 1.0, 1.0, &Config::default()).unwrap();
+        let cc = Complex::new(0.4, 1.1);
+        let mean = mean_op(move |z: Complex<f64>| (cc * z).exp(), 0.2, 0.8);
+        let xs: Vec<f64> = (0..60).map(|k| -3.3 + 0.157 * k as f64).collect();
+        for y in [0.7, -1.2, 2.0, 1.0, 3.5] {
+            for (row, single) in [
+                (sum.eval_row(y, &xs), xs.iter().map(|&x| sum.eval_complex(Complex::new(x, y))).collect::<Vec<_>>()),
+                (mean.eval_row(y, &xs), xs.iter().map(|&x| mean.eval_complex(Complex::new(x, y))).collect()),
+            ] {
+                for ((a, b), x) in row.iter().zip(&single).zip(&xs) {
+                    assert_eq!(is_finite(*a), is_finite(*b), "x={x} y={y}: {a} vs {b}");
+                    if is_finite(*b) {
+                        assert!((*a - *b).norm() < 1e-11 * b.norm().max(1.0), "x={x} y={y}: {a} vs {b}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn complex_points_of_the_mean() {
+        let cc = Complex::new(0.4, 1.1);
+        let f = move |z: Complex<f64>| (cc * z).exp();
+        let op = mean_op(f, 0.2, 0.8);
+        for z in [Complex::new(0.3, 0.9), Complex::new(-2.1, -0.6), Complex::new(3.3, 1.7)] {
+            let want = 2.0 * (cc * z).exp() / (c(1.0) + (-cc * 0.8).exp());
+            assert!((op.eval_complex(z) - want).norm() < 1e-10 * want.norm().max(1.0), "z={z}");
+        }
     }
 }

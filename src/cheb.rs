@@ -83,6 +83,48 @@ impl Chebyshev {
     }
 }
 
+// Chebyshev series of each component of g on [a, b], doubling the Lobatto grid from n_min until
+// every tail is below tol. None if a sample is None or n_max is reached first.
+pub(crate) fn fit<G>(a: f64, b: f64, n_min: usize, n_max: usize, tol: f64, g: G) -> Option<Vec<Chebyshev>>
+where
+    G: Fn(f64) -> Option<Vec<Complex<f64>>> + Sync + Send,
+{
+    let sample = |n: usize, js: &mut dyn Iterator<Item = usize>| -> Option<Vec<Vec<Complex<f64>>>> {
+        let js: Vec<usize> = js.collect();
+        crate::par::map(js, |j| g(lobatto_point(n, j, a, b))).into_iter().collect()
+    };
+    let mut n = n_min.max(2);
+    let mut values = sample(n, &mut (0..=n))?;
+    let dims = values[0].len();
+    if values.iter().any(|v| v.len() != dims) {
+        return None;
+    }
+    loop {
+        let mut series: Vec<Chebyshev> = (0..dims)
+            .map(|d| Chebyshev::from_lobatto_values(a, b, &values.iter().map(|v| v[d]).collect::<Vec<_>>()))
+            .collect();
+        if series.iter().all(|c| c.tail_ratio() <= tol) {
+            series.iter_mut().for_each(|c| c.chop(0.01 * tol));
+            return Some(series);
+        }
+        if 2 * n > n_max {
+            return None;
+        }
+        let fresh = sample(2 * n, &mut (0..n).map(|k| 2 * k + 1))?;
+        if fresh.iter().any(|v| v.len() != dims) {
+            return None;
+        }
+        let mut merged = Vec::with_capacity(2 * n + 1);
+        for (even, odd) in values.iter().zip(fresh) {
+            merged.push(even.clone());
+            merged.push(odd);
+        }
+        merged.push(values[n].clone());
+        values = merged;
+        n *= 2;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -99,6 +141,21 @@ mod tests {
             let x = -1.0 + 1.5 * i as f64 / 100.0;
             assert!((c.eval(x) - f(x)).norm() < 1e-13, "x={x}");
         }
+    }
+
+    #[test]
+    fn fit_doubles_until_converged() {
+        let g = |x: f64| Some(vec![Complex::new(0.0, 7.0 * x).exp(), Complex::new(1.0 / (1.2 - x), 0.0)]);
+        let fits = fit(-1.0, 1.0, 4, 512, 1e-14, g).expect("analytic on the interval");
+        for i in 0..=50 {
+            let x = -1.0 + i as f64 / 25.0;
+            let want = g(x).unwrap();
+            for (c, w) in fits.iter().zip(&want) {
+                assert!((c.eval(x) - *w).norm() < 1e-12 * w.norm().max(1.0), "x={x}");
+            }
+        }
+        // a pole on the interval never converges
+        assert!(fit(-1.0, 1.0, 4, 256, 1e-14, |x: f64| Some(vec![Complex::new(1.0 / x, 0.0)])).is_none());
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use crate::error::CalcError;
-use crate::expsum::{self, EvalFn, ExpPart};
-use crate::limits::{self, MAX_TERMS, PARSE_STACK_BYTES};
+use crate::expsum::{self, Closed, ExpPart};
+use crate::limits::{self, MAX_TERMS};
 use crate::util::{is_finite, Op};
 use formulac::expr::{ExprKind, ExprRef};
 use formulac::functions::FunctionKind;
@@ -17,8 +17,8 @@ const MAX_MONOMIAL_POWER: f64 = 100.0;
 
 // One term of the input, or of ln(input) for products.
 pub(crate) enum Term {
-    // Closed form independent of the seed strip.
-    Closed(EvalFn),
+    // Closed form independent of the seed strip, entire in z.
+    Closed(Closed),
     // coeff · (a z + b)^power with real a != 0, real b.
     Monomial { coeff: Complex<f64>, power: f64, a: f64, b: f64 },
     // Anything else: coeff · formula(z), summed by Abel-Plana.
@@ -46,17 +46,22 @@ pub(crate) fn classify_product(expr: &str, s: f64, closed: bool) -> Result<Vec<T
     on_parser_thread(move || classify_product_inner(&normalized, s, closed))
 }
 
+// wasm32-wasip1 has no threads: parse in place, within limits::check_expr's depth bound.
+#[cfg(target_family = "wasm")]
+fn on_parser_thread<T: Send>(f: impl FnOnce() -> Result<T, CalcError> + Send) -> Result<T, CalcError> {
+    f()
+}
+
 // Parse on a large-stack thread; a panic in formulac becomes an error.
+#[cfg(not(target_family = "wasm"))]
 fn on_parser_thread<T: Send>(f: impl FnOnce() -> Result<T, CalcError> + Send) -> Result<T, CalcError> {
     std::thread::scope(|scope| {
         let handle = std::thread::Builder::new()
             .name("norlundcalc-parse".to_string())
-            .stack_size(PARSE_STACK_BYTES)
+            .stack_size(limits::PARSE_STACK_BYTES)
             .spawn_scoped(scope, f)
             .map_err(|e| CalcError::BuildFailed(format!("could not start parser thread: {e}")))?;
-        handle
-            .join()
-            .unwrap_or_else(|_| Err(CalcError::BuildFailed("the expression parser panicked".to_string())))
+        handle.join().unwrap_or_else(|_| Err(CalcError::BuildFailed("the expression parser panicked".to_string())))
     })
 }
 
@@ -72,10 +77,7 @@ fn classify_inner(formula: &str, s: f64, op: Op, closed: bool) -> Result<Vec<Ter
     let mut terms = Vec::new();
     collect_terms(expr.view(), &mut terms);
     if terms.len() > MAX_TERMS {
-        return Err(CalcError::InvalidInput(format!(
-            "expression has {} terms; the limit is {MAX_TERMS}",
-            terms.len()
-        )));
+        return Err(CalcError::InvalidInput(format!("expression has {} terms; the limit is {MAX_TERMS}", terms.len())));
     }
     terms.into_iter().map(|(e, sign)| classify_term(e, Complex::new(sign, 0.0), s, op)).collect()
 }
@@ -104,7 +106,7 @@ fn classify_product_inner(formula: &str, s: f64, closed: bool) -> Result<Vec<Ter
     let mut terms = Vec::new();
     if c != ONE {
         let l = c.ln();
-        terms.push(Term::Closed(Box::new(move |x: f64| l * (x / s))));
+        terms.push(Term::Closed(Closed::new(move |z| l * (z / s), false)));
     }
     for f in factors {
         log_factor(f, s, &mut terms)?;
@@ -253,9 +255,9 @@ fn classify_term(term: E<'_>, scale: Complex<f64>, s: f64, op: Op) -> Result<Ter
     let body = match factors.as_slice() {
         // Σ c = c x/S; the mean inverse of c is c
         [] => {
-            let f: EvalFn = match op {
-                Op::Sum => Box::new(move |x: f64| c * (x / s)),
-                Op::Mean => Box::new(move |_: f64| c),
+            let f = match op {
+                Op::Sum => Closed::new(move |z| c * (z / s), false),
+                Op::Mean => Closed::new(move |_| c, false),
             };
             return Ok(Term::Closed(f));
         }
@@ -293,10 +295,9 @@ fn classify_term(term: E<'_>, scale: Complex<f64>, s: f64, op: Op) -> Result<Ter
                 }
             }
         }
-        ExprKind::FunctionCall {
-            kind: func @ (FunctionKind::Exp | FunctionKind::Sin | FunctionKind::Cos),
-            args,
-        } if args.len() == 1 => {
+        ExprKind::FunctionCall { kind: func @ (FunctionKind::Exp | FunctionKind::Sin | FunctionKind::Cos), args }
+            if args.len() == 1 =>
+        {
             if let Some((a, b)) = affine(args[0]) {
                 let real = is_real(c) && is_real(a) && is_real(b);
                 let parts: Vec<ExpPart> = match func {

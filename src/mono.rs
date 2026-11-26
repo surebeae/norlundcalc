@@ -49,7 +49,17 @@ const B2J_OVER_FACT: [f64; 14] = [
 ];
 
 // Largest integer power handled by the exact Bernoulli-polynomial path.
-const MAX_POLY_POWER: i32 = 20;
+pub(crate) const MAX_POLY_POWER: i32 = 20;
+
+// Whether (a z + b)^p has a polynomial principal sum and mean, entire in z.
+pub(crate) fn is_polynomial(p: f64) -> bool {
+    p == p.round() && (0.0..=MAX_POLY_POWER as f64).contains(&p)
+}
+
+// Σ_j coeffs[j] z^j by Horner.
+fn horner(coeffs: &[f64], z: Complex<f64>) -> Complex<f64> {
+    coeffs.iter().rev().fold(Complex::new(0.0, 0.0), |acc, &c| acc * z + c)
+}
 
 // Digamma for real x (NaN at 0, -1, -2, ...): reflection, recurrence, asymptotic series.
 pub(crate) fn digamma(x: f64) -> f64 {
@@ -72,31 +82,29 @@ pub(crate) fn digamma(x: f64) -> f64 {
     }
     let inv = 1.0 / x;
     let inv2 = inv * inv;
-    value + x.ln()
-        - 0.5 * inv
-        - inv2
-            * (1.0 / 12.0
-                - inv2 * (1.0 / 120.0 - inv2 * (1.0 / 252.0 - inv2 * (1.0 / 240.0 - inv2 * (1.0 / 132.0)))))
+    #[rustfmt::skip]
+    let series = inv2 * (1.0 / 12.0 - inv2 * (1.0 / 120.0 - inv2 * (1.0 / 252.0 - inv2 * (1.0 / 240.0 - inv2 / 132.0))));
+    value + x.ln() - 0.5 * inv - series
 }
 
 // Bernoulli polynomial B_n(x) for n <= 21, Horner in x.
 fn bernoulli_poly(n: usize, x: f64) -> f64 {
+    bernoulli_poly_c(n, Complex::new(x, 0.0)).re
+}
+
+fn bernoulli_poly_c(n: usize, z: Complex<f64>) -> Complex<f64> {
     debug_assert!(n < BERNOULLI.len());
     // B_n(x) = Σ_k C(n,k) B_k x^{n-k}; coefficient of x^j is C(n, n-j) B_{n-j}.
-    let mut acc = 0.0;
     let mut binom = 1.0;
     let mut coeffs = [0.0; 22];
     for k in 0..=n {
         coeffs[n - k] = binom * BERNOULLI[k];
         binom = binom * (n - k) as f64 / (k + 1) as f64;
     }
-    for j in (0..=n).rev() {
-        acc = acc * x + coeffs[j];
-    }
-    acc
+    horner(&coeffs[..=n], z)
 }
 
-// ln Γ(x) for x ≥ 1 (Stirling after shifting to x ≥ 15).
+// ln Γ(x) for x > 0 (Stirling after shifting to x ≥ 15).
 fn ln_gamma(x: f64) -> f64 {
     let mut x = x;
     let mut shift = 0.0;
@@ -190,6 +198,7 @@ fn hurwitz_fourier(p: f64, a: f64) -> f64 {
 // Hurwitz ζ(s, a), real s != 1, a > 0: Fourier series for s <= -6 and small a,
 // otherwise Euler-Maclaurin after shifting a up (kept low for s < 0, where the
 // shifted partial sums cancel against the tail).
+#[expect(clippy::neg_cmp_op_on_partial_ord, reason = "the negation also rejects NaN")]
 pub(crate) fn hurwitz_zeta(s: f64, a: f64) -> f64 {
     if !(a > 0.0) || !s.is_finite() || s == 1.0 {
         return f64::NAN;
@@ -244,19 +253,20 @@ pub(crate) fn hurwitz_zeta(s: f64, a: f64) -> f64 {
 // Euler polynomial E_n(x) for n <= 20: Appell, E_n(x) = Σ_k C(n,k) E_k(0) x^{n-k},
 // E_k(0) = -2(2^{k+1} - 1) B_{k+1}/(k+1).
 fn euler_poly(n: usize, x: f64) -> f64 {
+    euler_poly_c(n, Complex::new(x, 0.0)).re
+}
+
+fn euler_poly_c(n: usize, z: Complex<f64>) -> Complex<f64> {
     debug_assert!(n < BERNOULLI.len() - 1);
     let mut coeffs = [0.0; 22];
     let mut binom = 1.0;
     for k in 0..=n {
-        let e_k0 = if k == 0 { 1.0 } else { -2.0 * (2f64.powi(k as i32 + 1) - 1.0) * BERNOULLI[k + 1] / (k + 1) as f64 };
+        let e_k0 =
+            if k == 0 { 1.0 } else { -2.0 * (2f64.powi(k as i32 + 1) - 1.0) * BERNOULLI[k + 1] / (k + 1) as f64 };
         coeffs[n - k] = binom * e_k0;
         binom = binom * (n - k) as f64 / (k + 1) as f64;
     }
-    let mut acc = 0.0;
-    for j in (0..=n).rev() {
-        acc = acc * x + coeffs[j];
-    }
-    acc
+    horner(&coeffs[..=n], z)
 }
 
 // η(-p, a), p ≥ 6, 0 < a <= 1, by the Fourier series
@@ -280,6 +290,7 @@ fn eta_fourier(p: f64, a: f64) -> f64 {
 // η(s, a) ~ a^{-s}/2 - Σ_{n≥1} (2^{2n} - 1) B_{2n}/(2n)! · (d/da)^{2n-1} a^{-s}.
 // Small a: Fourier series for s <= -6, 2^{-s}(ζ(s, a/2) - ζ(s, (a+1)/2)) for -6 < s < 0,
 // and shifting up to the asymptotic range for s ≥ 0, where nothing cancels.
+#[expect(clippy::neg_cmp_op_on_partial_ord, reason = "the negation also rejects NaN")]
 pub(crate) fn eta(s: f64, a: f64) -> f64 {
     if !(a > 0.0) || !s.is_finite() {
         return f64::NAN;
@@ -295,7 +306,7 @@ pub(crate) fn eta(s: f64, a: f64) -> f64 {
         let a0 = a - m;
         let mut acc = KahanSum::default();
         let m = m as u64;
-        let parity = |k: u64| if k % 2 == 0 { 1.0 } else { -1.0 };
+        let parity = |k: u64| if k.is_multiple_of(2) { 1.0 } else { -1.0 };
         acc.add(Complex::new(parity(m) * eta_fourier(-s, a0), 0.0));
         for j in 0..m {
             acc.add(Complex::new(parity(m - 1 - j) * (a0 + j as f64).powf(-s), 0.0));
@@ -422,6 +433,14 @@ impl MonomialSum {
         v * self.scale
     }
 
+    // F(z) up to the same constant, for polynomial kinds (entire); None otherwise.
+    pub(crate) fn eval_raw_complex(&self, z: Complex<f64>) -> Option<Complex<f64>> {
+        match self.kind {
+            Kind::Polynomial(k) => Some(bernoulli_poly_c(k + 1, z / self.s + 1.0) / (k + 1) as f64 * self.scale),
+            _ => None,
+        }
+    }
+
     fn right(&self, t: f64) -> Complex<f64> {
         let a = t + 1.0;
         if a > 0.0 {
@@ -500,6 +519,11 @@ impl MonomialMean {
         } else {
             Complex::new(v, 0.0).powf(self.p)
         }
+    }
+
+    // G(z) for polynomial means (entire); None otherwise.
+    pub(crate) fn eval_complex(&self, z: Complex<f64>) -> Option<Complex<f64>> {
+        self.poly.map(|n| euler_poly_c(n, z / self.s + 1.0) * self.scale)
     }
 
     // G(x) with (G(x) + G(x - S))/2 = x^p.
@@ -666,7 +690,9 @@ mod tests {
         // ζ(-2.5, 1) = ζ(-2.5) = 0.008516928...
         assert!((hurwitz_zeta(-2.5, 1.0) - 0.008516928).abs() < 1e-8);
         // ζ(s,a) - ζ(s,a+1) = a^{-s}
-        for &(s, a) in &[(-3.7, 0.2), (1.5, 4.4), (-0.5, 1e6), (7.0, 0.01), (-6.5, 0.3), (-9.0, 2.2), (-25.5, 0.9), (-25.0, 7.5)] {
+        #[rustfmt::skip]
+        let cases = [(-3.7, 0.2), (1.5, 4.4), (-0.5, 1e6), (7.0, 0.01), (-6.5, 0.3), (-9.0, 2.2), (-25.5, 0.9), (-25.0, 7.5)];
+        for &(s, a) in &cases {
             let (z0, z1) = (hurwitz_zeta(s, a), hurwitz_zeta(s, a + 1.0));
             let rhs = a.powf(-s);
             // the difference cancels: tolerance relative to the operands
@@ -686,10 +712,7 @@ mod tests {
                     if !lhs.re.is_finite() {
                         continue; // landed on a pole of this branch
                     }
-                    assert!(
-                        (lhs - rhs).norm() <= 1e-9 * rhs.norm().max(1.0),
-                        "p={p} {branch:?} x={x}: {lhs} vs {rhs}"
-                    );
+                    assert!((lhs - rhs).norm() <= 1e-9 * rhs.norm().max(1.0), "p={p} {branch:?} x={x}: {lhs} vs {rhs}");
                 }
             }
         }

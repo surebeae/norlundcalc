@@ -24,8 +24,7 @@ impl GaussRule {
         acc * w
     }
 
-    #[cfg(test)]
-    // ∫_a^b f over panels equal panels.
+    // ∫_a^b f over equal panels.
     pub(crate) fn integrate_panels<F: FnMut(f64) -> Complex<f64>>(
         &self,
         a: f64,

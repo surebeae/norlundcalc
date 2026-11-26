@@ -71,7 +71,6 @@ pub(crate) struct Image {
     pub rgba: Vec<u8>,
 }
 
-
 // Ticks at 1, 2, 5 x 10^k aiming for about target intervals.
 pub(crate) fn nice_ticks(lo: f64, hi: f64, target: usize) -> (Vec<f64>, f64) {
     let span = hi - lo;
@@ -81,6 +80,7 @@ pub(crate) fn nice_ticks(lo: f64, hi: f64, target: usize) -> (Vec<f64>, f64) {
     let raw = span / target as f64;
     let mag = 10f64.powf(raw.log10().floor());
     let norm = raw / mag;
+    #[rustfmt::skip]
     let step = mag * if norm < 1.5 { 1.0 } else if norm < 3.0 { 2.0 } else if norm < 7.0 { 5.0 } else { 10.0 };
     let first = (lo / step - 1e-9).ceil() as i64;
     let last = (hi / step + 1e-9).floor() as i64;
@@ -113,7 +113,11 @@ pub(crate) fn format_tick(v: f64, step: f64) -> String {
             .unwrap_or(12) as usize;
         format!("{v:.decimals$}")
     };
-    let s = if s.trim_start_matches('-').chars().all(|c| c == '0' || c == '.') { s.trim_start_matches('-').to_string() } else { s };
+    let s = if s.trim_start_matches('-').chars().all(|c| c == '0' || c == '.') {
+        s.trim_start_matches('-').to_string()
+    } else {
+        s
+    };
     s.replacen('-', "\u{2212}", 1)
 }
 
@@ -183,7 +187,6 @@ impl Frame {
     }
 }
 
-
 // Coverage mask of a single line of text, baseline at ascent.
 struct TextMask {
     width: usize,
@@ -194,10 +197,8 @@ struct TextMask {
 
 fn text_mask(s: &str, px: f32) -> TextMask {
     let font = font();
-    let (ascent, descent) = font
-        .horizontal_line_metrics(px)
-        .map(|m| (m.ascent, m.descent))
-        .unwrap_or((0.8 * px, -0.2 * px));
+    let (ascent, descent) =
+        font.horizontal_line_metrics(px).map(|m| (m.ascent, m.descent)).unwrap_or((0.8 * px, -0.2 * px));
     let mut glyphs = Vec::new();
     let mut pen = 0.0f32;
     let mut prev: Option<char> = None;
@@ -267,7 +268,6 @@ fn blit(pix: &mut Pixmap, mask: &TextMask, x: f32, baseline: f32, align: Align, 
     }
 }
 
-
 fn paint(c: Rgb) -> Paint<'static> {
     let mut p = Paint::default();
     p.set_color_rgba8(c.0, c.1, c.2, 255);
@@ -281,7 +281,9 @@ fn fill_rect(pix: &mut Pixmap, l: f32, t: f32, r: f32, b: f32, c: Rgb) {
     }
 }
 
-fn stroke_lines(pix: &mut Pixmap, segments: &[((f32, f32), (f32, f32))], width: f32, c: Rgb) {
+type Segment = ((f32, f32), (f32, f32));
+
+fn stroke_lines(pix: &mut Pixmap, segments: &[Segment], width: f32, c: Rgb) {
     let mut pb = PathBuilder::new();
     for &((x0, y0), (x1, y1)) in segments {
         pb.move_to(x0, y0);
@@ -351,7 +353,8 @@ pub(crate) fn render(fig: &Figure<'_>, scale: f32) -> Result<Image, String> {
             Style::Line { width } => {
                 let lw = (width * s).max(1.25);
                 let pad = 4.0 * lw as f64;
-                let clip = (frame.left - pad, frame.top - pad, frame.left + frame.width + pad, frame.top + frame.height + pad);
+                let clip =
+                    (frame.left - pad, frame.top - pad, frame.left + frame.width + pad, frame.top + frame.height + pad);
                 let mut pb = PathBuilder::new();
                 let mut pen: Option<(f64, f64)> = None;
                 for pair in series.points.windows(2) {
@@ -374,7 +377,8 @@ pub(crate) fn render(fig: &Figure<'_>, scale: f32) -> Result<Image, String> {
                     }
                 }
                 if let Some(path) = pb.finish() {
-                    let stroke = Stroke { width: lw, line_cap: LineCap::Round, line_join: LineJoin::Round, ..Stroke::default() };
+                    let stroke =
+                        Stroke { width: lw, line_cap: LineCap::Round, line_join: LineJoin::Round, ..Stroke::default() };
                     pix.stroke_path(&path, &paint(series.color), &stroke, Transform::identity(), None);
                 }
             }
@@ -383,12 +387,24 @@ pub(crate) fn render(fig: &Figure<'_>, scale: f32) -> Result<Image, String> {
                 let mut pb = PathBuilder::new();
                 for &(x, y) in series.points {
                     let (px, py) = (frame.px(x), frame.py(y));
-                    if px.is_finite() && py.is_finite() && px >= frame.left && px <= frame.left + frame.width && py >= frame.top && py <= frame.top + frame.height {
+                    if px.is_finite()
+                        && py.is_finite()
+                        && px >= frame.left
+                        && px <= frame.left + frame.width
+                        && py >= frame.top
+                        && py <= frame.top + frame.height
+                    {
                         pb.push_circle(px as f32, py as f32, r);
                     }
                 }
                 if let Some(path) = pb.finish() {
-                    pix.fill_path(&path, &paint(series.color), tiny_skia::FillRule::Winding, Transform::identity(), None);
+                    pix.fill_path(
+                        &path,
+                        &paint(series.color),
+                        tiny_skia::FillRule::Winding,
+                        Transform::identity(),
+                        None,
+                    );
                 }
             }
         }
@@ -445,16 +461,50 @@ pub(crate) fn render(fig: &Figure<'_>, scale: f32) -> Result<Image, String> {
     Ok(Image { width: w, height: h, rgba: pix.take() })
 }
 
+// Bilinear resampling of an RGB image to out_w x out_h, as opaque RGBA.
+pub(crate) fn resample(rgb: &[u8], w: usize, h: usize, out_w: usize, out_h: usize) -> Image {
+    let mut rgba = vec![255u8; 4 * out_w * out_h];
+    if w == 0 || h == 0 || rgb.len() != 3 * w * h {
+        return Image { width: out_w as u32, height: out_h as u32, rgba };
+    }
+    // source coordinate of an output pixel centre: the two neighbours and the weight of the second
+    let axis = |p: usize, out: usize, n: usize| {
+        let u = ((p as f64 + 0.5) * n as f64 / out as f64 - 0.5).clamp(0.0, (n - 1) as f64);
+        let i = (u.floor() as usize).min(n.saturating_sub(2));
+        (i, (i + 1).min(n - 1), u - i as f64)
+    };
+    for py in 0..out_h {
+        let (j0, j1, fy) = axis(py, out_h, h);
+        for px in 0..out_w {
+            let (i0, i1, fx) = axis(px, out_w, w);
+            let at = |i: usize, j: usize, k: usize| rgb[3 * (j * w + i) + k] as f64;
+            let o = 4 * (py * out_w + px);
+            for k in 0..3 {
+                let top = at(i0, j0, k) * (1.0 - fx) + at(i1, j0, k) * fx;
+                let bottom = at(i0, j1, k) * (1.0 - fx) + at(i1, j1, k) * fx;
+                rgba[o + k] = (top * (1.0 - fy) + bottom * fy + 0.5) as u8;
+            }
+        }
+    }
+    Image { width: out_w as u32, height: out_h as u32, rgba }
+}
+
 // Write img as an 8-bit RGBA PNG with fast compression.
 pub(crate) fn write_png(img: &Image, path: &Path) -> Result<(), String> {
-    let file = std::fs::File::create(path).map_err(|e| format!("creating {}: {e}", path.display()))?;
-    let mut enc = png::Encoder::new(std::io::BufWriter::new(file), img.width, img.height);
+    let bytes = encode_png(img)?;
+    std::fs::write(path, bytes).map_err(|e| format!("writing {}: {e}", path.display()))
+}
+
+pub(crate) fn encode_png(img: &Image) -> Result<Vec<u8>, String> {
+    let mut out = Vec::new();
+    let mut enc = png::Encoder::new(&mut out, img.width, img.height);
     enc.set_color(png::ColorType::Rgba);
     enc.set_depth(png::BitDepth::Eight);
     enc.set_compression(png::Compression::Fast);
     let mut writer = enc.write_header().map_err(|e| format!("PNG header: {e}"))?;
     writer.write_image_data(&img.rgba).map_err(|e| format!("PNG data: {e}"))?;
-    writer.finish().map_err(|e| format!("PNG finish: {e}"))
+    writer.finish().map_err(|e| format!("PNG finish: {e}"))?;
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -523,7 +573,13 @@ mod tests {
             x_range: (0.0, 10.0),
             y_range: (-8.0, 8.0),
             series: vec![Series { points: &pts, color: red, style: Style::Line { width: 2.0 } }],
-            theme: Theme { background: Rgb(0, 0, 0), axis: Rgb(1, 1, 1), grid: Rgb(2, 2, 2), tick: Rgb(3, 3, 3), text: Rgb(4, 4, 4) },
+            theme: Theme {
+                background: Rgb(0, 0, 0),
+                axis: Rgb(1, 1, 1),
+                grid: Rgb(2, 2, 2),
+                tick: Rgb(3, 3, 3),
+                text: Rgb(4, 4, 4),
+            },
         };
         let img = render(&fig, 1.0).unwrap();
         let is_red = |col: usize, row: usize| {
@@ -538,5 +594,23 @@ mod tests {
         assert!(is_red(col(8.5), 779), "line at x = 8.5 missing");
         // the near-vertical drop at x = 6.9 toward -1e307, low in the frame
         assert!(is_red(col(6.9), 1200), "drop at x = 6.9 missing");
+    }
+
+    #[test]
+    fn resampling_keeps_flat_regions() {
+        // left half red, right half blue, 4 x 2 to 40 x 20
+        let mut rgb = Vec::new();
+        for _ in 0..2 {
+            for i in 0..4 {
+                rgb.extend_from_slice(if i < 2 { &[200, 0, 0] } else { &[0, 0, 200] });
+            }
+        }
+        let img = resample(&rgb, 4, 2, 40, 20);
+        let px = |x: usize, y: usize| {
+            let o = 4 * (y * 40 + x);
+            [img.rgba[o], img.rgba[o + 1], img.rgba[o + 2], img.rgba[o + 3]]
+        };
+        assert_eq!(px(2, 10), [200, 0, 0, 255]);
+        assert_eq!(px(37, 3), [0, 0, 200, 255]);
     }
 }
