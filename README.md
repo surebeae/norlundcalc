@@ -472,8 +472,6 @@ exec wasmtime run --env "GATEWAY_INTERFACE=$GATEWAY_INTERFACE" --env "REQUEST_ME
 
 ## Compilation
 
-Each future [release](https://github.com/surebeae/norlundcalc/releases) will have `norlundcalc-cli` and `norlundcalc-web` built for Linux (static musl binaries, which also run on glibc systems) on x86_64 and aarch64, Windows x86_64, and macOS on aarch64 and x86_64, with a `SHA256SUMS` file. To build them yourself:
-
 ```
 git clone https://github.com/surebeae/norlundcalc
 cd norlundcalc
