@@ -447,7 +447,7 @@ Responses carry `X-Content-Type-Options: nosniff`, and pages a `Content-Security
 norlundcalc-web --listen 127.0.0.1:8080
 ```
 
-One thread per connection, at most 64 connections (more are closed at once); at most 4 requests computing at once (503 otherwise), counted once a request has arrived; 10 s in all to send the request head, 30 s per write to take the response. A request that computes cannot be cancelled, so the limits above bound its work but not its time. The results of the 8 most recently used forms are kept, so the page, its image and the downloads share one build, and a request for something still being computed waits for it. Plain HTTP; put it behind a reverse proxy to serve it beyond the local machine.
+One thread per connection, at most 64 connections (more are closed at once); at most 4 requests computing at once (503 otherwise), counted once a request has arrived; 10 s in all to send the request head, 30 s per write to take the response. A request that computes cannot be cancelled, so the limits above bound its work but not its time. The results of the 8 most recently used forms are kept, so the page, its image and the downloads share one build, and a request for something still being computed waits for it. Plain HTTP; put it behind a reverse proxy to serve it beyond the local machine or more ideally with [dumbpipe](https://www.dumbpipe.dev/) if you simply want to share with a few trusted peers.
 
 ### As CGI
 
