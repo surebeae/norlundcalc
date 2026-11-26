@@ -2,17 +2,28 @@
 name = "norlundcalc"
 version = "0.3.0"
 edition = "2021"
+rust-version = "1.95"
 
 [lib]
 name = "norlundcalc"
-crate-type = ["cdylib", "rlib"]
+crate-type = ["rlib"]
 
 [[bin]]
 name = "norlundcalc-cli"
 path = "src/main.rs"
 
+[[bin]]
+name = "norlundcalc-web"
+path = "src/web.rs"
+required-features = ["cli"]
+
 [features]
-default = ["cli"]
+default = ["cli", "parallel"]
+
+# rayon; off for wasm32-wasip1, which has no threads
+parallel = [
+  "dep:rayon",
+]
 
 # CLI plotting dependencies
 cli = [
@@ -29,13 +40,15 @@ python = [
 
 [dependencies]
 num-complex = "0.4"
-rayon = "1.10"
+rayon = { version = "1.10", optional = true }
 formulac = "0.9.1"
 tiny-skia = { version = "0.12.0", default-features = false, features = ["std", "simd"], optional = true }
 fontdue = { version = "0.9", optional = true }
 png = { version = "0.18.1", optional = true }
-rustix = { version = "1", features = ["termios"], optional = true }
 pyo3 = { version = "0.30", features = ["num-complex"], optional = true }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["termios"], optional = true }
 
 [profile.release]
 lto = "fat"

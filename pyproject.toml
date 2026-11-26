@@ -19,5 +19,5 @@ classifiers = [
 
 [tool.maturin]
 bindings = "pyo3"
-features = ["python"]
+features = ["python", "parallel"]
 no-default-features = true
