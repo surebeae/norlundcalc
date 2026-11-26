@@ -421,8 +421,8 @@ impl<F: Fn(Complex<f64>) -> Complex<f64> + Sync> AbelPlanaSum<F> {
         let Some(b) = self.base_at(&u, Complex::new(r, y)) else {
             return NAN;
         };
-        let line = |v: f64| u(Complex::new(v, y));
-        recur(self.op, &line, b, t, n, r).map(|v| v - self.c).unwrap_or(NAN)
+        let at = |m: i64| lattice_point(&self.f, z.re, z.im, h, s, t, m);
+        recur(self.op, &at, b, n).map(|v| v - self.c).unwrap_or(NAN)
     }
 
     // Values on the row Im z = y. The base along the row is one Chebyshev series in Re over the seed
@@ -431,7 +431,7 @@ impl<F: Fn(Complex<f64>) -> Complex<f64> + Sync> AbelPlanaSum<F> {
         if y == 0.0 {
             return xs.iter().map(|&x| self.eval_raw(x)).collect();
         }
-        let (h, s) = (self.h, self.s);
+        let (h, s, y_row) = (self.h, self.s, y);
         let y = y / s;
         let u = |w: Complex<f64>| (self.f)(Complex::new(s * w.re + h, s * w.im));
         let cfg = &self.config;
@@ -439,7 +439,6 @@ impl<F: Fn(Complex<f64>) -> Complex<f64> + Sync> AbelPlanaSum<F> {
         let fitted =
             cheb::fit(0.0, 1.0, n_min, n_max, cfg.cheb_tol, |r| self.base_at(&u, Complex::new(r, y)).map(|b| vec![b]));
         let base = fitted.and_then(|mut v| v.pop());
-        let line = |v: f64| u(Complex::new(v, y));
         xs.iter()
             .map(|&x| {
                 let Some((t, n, r)) = lattice(h, s, self.max_recurrence, x) else {
@@ -452,7 +451,8 @@ impl<F: Fn(Complex<f64>) -> Complex<f64> + Sync> AbelPlanaSum<F> {
                         None => return NAN,
                     },
                 };
-                recur(self.op, &line, b, t, n, r).map(|v| v - self.c).unwrap_or(NAN)
+                let at = |m: i64| lattice_point(&self.f, x, y_row, h, s, t, m);
+                recur(self.op, &at, b, n).map(|v| v - self.c).unwrap_or(NAN)
             })
             .collect()
     }
@@ -562,19 +562,40 @@ fn raw_eval<F: Fn(Complex<f64>) -> Complex<f64>>(
     x: f64,
 ) -> Option<Complex<f64>> {
     let (t, n, r) = lattice(h, s, max_recurrence, x)?;
-    let u = |v: f64| f(Complex::new(s * v + h, 0.0));
-    recur(op, &u, base.eval(r), t, n, r)
+    let at = |m: i64| lattice_point(f, x, 0.0, h, s, t, m);
+    recur(op, &at, base.eval(r), n)
 }
 
-// The solution at t from the base value b at r = t - n (b = F(r - 1) for the sum, G(r) for the mean).
-fn recur<U: Fn(f64) -> Complex<f64>>(op: Op, u: &U, b: Complex<f64>, t: f64, n: i64, r: f64) -> Option<Complex<f64>> {
+// f at x - mS + iy for x = h + S·t. Taken from x itself: h + S·(t - m) differs from it by rounding,
+// which a branch point there amplifies (√ turns 1e-16 into 1e-8). Where f is not finite at the exact
+// point, as at the removable singularity of sin(z)/z at 0, the rounded point is used instead.
+pub(crate) fn lattice_point<F: Fn(Complex<f64>) -> Complex<f64>>(
+    f: &F,
+    x: f64,
+    y: f64,
+    h: f64,
+    s: f64,
+    t: f64,
+    m: i64,
+) -> Complex<f64> {
+    let v = f(Complex::new(x - m as f64 * s, y));
+    if is_finite(v) {
+        v
+    } else {
+        f(Complex::new(s * (t - m as f64) + h, y))
+    }
+}
+
+// The solution at x = h + S·t from the base value b at r = t - n (b = F(r - 1) for the sum, G(r)
+// for the mean); at(m) is f at x - mS (see lattice_point).
+fn recur<A: Fn(i64) -> Complex<f64>>(op: Op, at: &A, b: Complex<f64>, n: i64) -> Option<Complex<f64>> {
     if op == Op::Mean {
-        return mean_recurrence(u, b, t, n, r);
+        return mean_recurrence(at, b, n);
     }
     let mut acc = KahanSum::default();
     if n >= 0 {
         for k in 0..=n {
-            let term = u(t - k as f64);
+            let term = at(k);
             if !is_finite(term) {
                 return None;
             }
@@ -584,26 +605,26 @@ fn recur<U: Fn(f64) -> Complex<f64>>(op: Op, u: &U, b: Complex<f64>, t: f64, n: 
         Some(acc.total())
     } else {
         for k in 1..=(-n) {
-            let term = u(t + k as f64);
+            let term = at(-k);
             if !is_finite(term) {
                 return None;
             }
             acc.add(-term);
         }
         acc.add(b);
-        acc.add(u(r));
+        acc.add(at(n));
         Some(acc.total())
     }
 }
 
 // G(y + nS) = (-1)^n G(y) + 2 Σ_{k=1}^{n} (-1)^{n-k} f(y + kS),
 // G(y - mS) = (-1)^m G(y) + 2 Σ_{j=0}^{m-1} (-1)^{m-1-j} f(y - jS),  y = h + rS.
-fn mean_recurrence<U: Fn(f64) -> Complex<f64>>(u: &U, b: Complex<f64>, t: f64, n: i64, r: f64) -> Option<Complex<f64>> {
+fn mean_recurrence<A: Fn(i64) -> Complex<f64>>(at: &A, b: Complex<f64>, n: i64) -> Option<Complex<f64>> {
     let parity = |k: i64| if k % 2 == 0 { 1.0 } else { -1.0 };
     let mut acc = KahanSum::default();
     if n >= 0 {
         for k in 1..=n {
-            let term = u(t - (n - k) as f64);
+            let term = at(n - k);
             if !is_finite(term) {
                 return None;
             }
@@ -612,7 +633,7 @@ fn mean_recurrence<U: Fn(f64) -> Complex<f64>>(u: &U, b: Complex<f64>, t: f64, n
     } else {
         let m = -n;
         for j in 0..m {
-            let term = u(r - j as f64);
+            let term = at(n + j);
             if !is_finite(term) {
                 return None;
             }
@@ -687,6 +708,19 @@ pub(crate) mod tests {
     fn non_unit_step() {
         let f = |z: Complex<f64>| (Complex::new(0.3, 0.0) * z).sin() + z;
         check_difference_equation(f, -0.2, 2.5, &[0.1, 3.3, 9.0, -6.0], 1e-10);
+    }
+
+    // From the seed [0.1, 1.1], x = -1 reaches the branch point 0 of e^√z. Taken as
+    // 0.1 + (-1.1 + 1) it was -8e-17, on the cut, and √ made that a 9e-9 error in F(-1) = -1.
+    #[test]
+    fn lattice_points_on_a_branch_point_are_exact() {
+        let f = |z: Complex<f64>| z.sqrt().exp();
+        let op = AbelPlanaSum::new(f, 0.1, 1.0, &Config::default()).unwrap();
+        let d = op.eval_raw(-1.0) - op.eval_raw(0.0);
+        assert!((d - Complex::new(-1.0, 0.0)).norm() < 1e-13, "{d}");
+        let d = op.eval_raw(-2.0) - op.eval_raw(-1.0);
+        let want = -Complex::new(0.0, 1.0).exp();
+        assert!((d - want).norm() < 1e-13, "{d} vs {want}");
     }
 
     #[test]

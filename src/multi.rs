@@ -162,7 +162,8 @@ impl<F: Fn(CF) -> CF + Sync> RepeatedSum<F> {
                     Some(series) => Some(series.iter().map(|c| c.eval(r)).collect()),
                     None => at(r),
                 };
-                v.and_then(|v| self.walk(&u, v, steps, r, ys)).map_or(NAN, |raw| self.normalise(&raw, z))
+                let at = |m: i64| crate::abel::lattice_point(&self.f, x, y, h, s, steps as f64 + r, m);
+                v.and_then(|v| self.walk(&at, v, steps)).map_or(NAN, |raw| self.normalise(&raw, z))
             })
             .collect()
     }
@@ -197,15 +198,17 @@ impl<F: Fn(CF) -> CF + Sync> RepeatedSum<F> {
         } else {
             bases_at(&u, self.n, Complex::new(r, y), self.mode, &gauss_legendre(self.config.gl_order), &self.config)?
         };
-        self.walk(&u, v, steps, r, y)
+        let at = |m: i64| crate::abel::lattice_point(&self.f, z.re, z.im, h, s, steps as f64 + r, m);
+        self.walk(&at, v, steps)
     }
 
-    // From the bases at r to the point steps + r of the scaled line Im w = y.
-    fn walk<U: Fn(CF) -> CF>(&self, u: &U, mut v: Vec<CF>, steps: i64, r: f64, y: f64) -> Option<Vec<CF>> {
+    // From the bases at r to the point z = steps + r of the scaled line; at(m) is f at z - mS (see
+    // abel::lattice_point).
+    fn walk<A: Fn(i64) -> CF>(&self, at: &A, mut v: Vec<CF>, steps: i64) -> Option<Vec<CF>> {
         if steps >= 0 {
             // F_m(w + 1) = F_m(w) + F_{m-1}(w + 1)
             for k in 1..=steps {
-                let mut lower = u(Complex::new(r + k as f64, y));
+                let mut lower = at(steps - k);
                 if !is_finite(lower) {
                     return None;
                 }
@@ -217,7 +220,7 @@ impl<F: Fn(CF) -> CF + Sync> RepeatedSum<F> {
         } else {
             // F_m(w - 1) = F_m(w) - F_{m-1}(w), highest order first so F_{m-1}(w) is still current
             for k in 0..(-steps) {
-                let u_w = u(Complex::new(r - k as f64, y));
+                let u_w = at(steps + k);
                 if !is_finite(u_w) {
                     return None;
                 }

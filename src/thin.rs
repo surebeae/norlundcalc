@@ -62,8 +62,9 @@ impl<F> StripShift<F>
 where
     F: Fn(CF) -> CF + Send + Sync,
 {
-    // Ok(None) if the target line lies in the closed seed strip, which validation found free of
-    // singular points edges included: its maximal strip is the seed's own.
+    // Ok(None) if the target line lies in the seed strip, whose maximal strip is then the one asked
+    // for. Validation accepts a singular point on a seed edge, so an edge counts only where f is
+    // finite on the axis; a line through a singular point at an edge falls through and is rejected.
     pub(crate) fn new(
         f: F,
         op: Op,
@@ -76,10 +77,12 @@ where
             return Err("non-finite strip parameters".to_string());
         }
         let seed_hi = seed_lo + s;
-        if target >= seed_lo && target <= seed_hi {
+        let inside = target > seed_lo && target < seed_hi;
+        let on_edge = target == seed_lo || target == seed_hi;
+        if inside || (on_edge && is_finite(f(Complex::new(target, 0.0)))) {
             return Ok(None);
         }
-        let (sign, gap) = if target > seed_hi { (1.0, target - seed_hi) } else { (-1.0, seed_lo - target) };
+        let (sign, gap) = if target >= seed_hi { (1.0, target - seed_hi) } else { (-1.0, seed_lo - target) };
         let mut scale: f64 = 1.0;
         for &c in &[target, seed_lo + 0.5 * s] {
             for &y in &[-0.7 * s, -0.3 * s, 0.3 * s, 0.7 * s] {
@@ -478,6 +481,11 @@ mod tests {
         let cfg = Config::default();
         assert!(StripShift::new(f, Op::Sum, 1.0, 0.1 + 1.0, 0.1, &cfg).unwrap().is_none());
         assert!(StripShift::new(f, Op::Sum, 1.0, 0.1, 0.1, &cfg).unwrap().is_none());
+        // a pole on the edge: the line passes through it
+        let g = |z: CF| c(1.0) / (z - c(1.1));
+        assert!(StripShift::new(g, Op::Sum, 1.0, 0.1 + 1.0, 0.1, &cfg).is_err());
+        let g = |z: CF| c(1.0) / (z - c(0.1));
+        assert!(StripShift::new(g, Op::Sum, 1.0, 0.1, 0.1, &cfg).is_err());
     }
 
     #[test]
