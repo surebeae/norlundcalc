@@ -3,6 +3,8 @@ name = "norlundcalc"
 version = "0.3.0"
 edition = "2021"
 rust-version = "1.95"
+# `cargo run` in the README means the CLI
+default-run = "norlundcalc-cli"
 
 [lib]
 name = "norlundcalc"

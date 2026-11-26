@@ -55,15 +55,17 @@ In both examples the zero point is $a=0$. The program may use a different $a$ vi
 
 ## Strips
 
-Without `--h`, a seed strip $[h, h+S]$ is searched and reported (`Using seed strip [h, h+S]`). With `--h`, a valid seed strip is used as is. If $[h, h+S]$ holds a singular point or a cut, the result is the principal solution for the maximal strip containing the line $\mathrm{Re}\thinspace z = h$, computed from a searched seed by residue sums over the singular points in between. This includes strips narrower than $S$:
+Without `--h`, a seed strip $[h, h+S]$ is searched and reported (`Using seed strip [h, h+S]`). With `--h`, a valid seed strip is used as is. If $[h, h+S]$ holds a singular point (other than on an edge) or a cut, the result is the principal solution for the maximal strip containing the line $\mathrm{Re}\thinspace z = h$, computed from a searched seed by residue sums over the singular points in between. This includes strips narrower than $S$:
 
 ```
 cargo run --release -- --function "1/z + 1/(z-0.5)" --h 0.25 --a 0
 ```
 
-gives $\psi(x+1) + \psi(\tfrac12 - x) - \psi(1) - \psi(\tfrac12)$, the solution for the strip $(0, \tfrac12)$. A line through a singular point is rejected.
+gives $\psi(x+1) + \psi(\tfrac12 - x) - \psi(1) - \psi(\tfrac12)$, the solution for the strip $(0, \tfrac12)$.
 
-A seed strip lying on a horizontal branch cut is rejected by validation, since Abel–Plana would take $f$ from both sides of the cut. With an explicit `--h` on such a cut, $f$ takes its values from above and is continued below the axis, provided the jump $f_\uparrow - f_\downarrow$ (or the ratio $f_\uparrow / f_\downarrow$) is constant along the strip. The glued function is then analytic across the cut, so the continuation is exact, and the result is the principal solution for the cut turned downward. This covers powers and roots (a constant factor), logarithms and $\mathrm{atanh}$ (a constant offset), and anything multiplied by or added to an analytic function. For $\sqrt z$ with `--h -5` it gives $i\thinspace \zeta(-\tfrac12, -x)$; for $e^{\sqrt z}$, whose continuation is neither, the strip is rejected.
+A singular point on an edge of $[h, h+S]$ does not make the strip invalid; the result is the solution for the strip containing $(h, h+S)$. For `1/z`, `--h 0` gives $\psi(x+1)$ and `--h -1` gives $\psi(-x)$, each up to the constant that sets $F(a) = 0$. When $[h, h+S]$ is invalid for another reason, so that residue sums are needed, a line $\mathrm{Re}\thinspace z = h$ through a singular point is rejected.
+
+A seed strip lying on a horizontal branch cut is rejected by validation, since Abel–Plana would take $f$ from both sides of the cut. With an explicit `--h` on such a cut, $f$ takes its values from above and is continued below the axis, provided the jump $f_\uparrow - f_\downarrow$ (or the ratio $f_\uparrow / f_\downarrow$) is constant along the strip. The glued function is then analytic across the cut, so the continuation is exact, and the result is the principal solution for the cut turned downward. This covers powers and roots (a constant factor), logarithms and $\mathrm{atanh}$ (a constant offset), and anything multiplied by or added to an analytic function. For $\sqrt z$ with `--h -5` it gives $i\thinspace (\zeta(-\tfrac12, -x) - \zeta(-\tfrac12, -a))$; for $e^{\sqrt z}$ with `--h -5`, whose sheet change is neither, the strip is rejected. (Without `--h`, $e^{\sqrt z}$ sums from a cut-free seed right of $0$, and the recurrence carries the values from above to the left of $0$.)
 
 With a cut in use, $f$ takes its values from above on the whole real axis wherever it jumps, whatever its formula returns there. The search tries cut-free seeds first and then seeds on cuts, and residue sums run from either. So a strip between two branch points with cuts along the rest of the axis is reached too: for $\mathrm{atanh}\sqrt z$, `--h 0.5` gives the solution for $(0, 1)$, the same from a seed on either cut.
 
@@ -447,14 +449,6 @@ norlundcalc-web --listen 127.0.0.1:8080
 
 One thread per connection, at most 64 connections (more are closed at once); at most 4 requests computing at once (503 otherwise), counted once a request has arrived; 10 s in all to send the request head, 30 s per write to take the response. A request that computes cannot be cancelled, so the limits above bound its work but not its time. The results of the 8 most recently used forms are kept, so the page, its image and the downloads share one build, and a request for something still being computed waits for it. Plain HTTP; put it behind a reverse proxy to serve it beyond the local machine.
 
-Each release also has a container image with the server alone (`linux/amd64`, `linux/arm64`):
-
-```
-docker run --rm -p 127.0.0.1:8080:8080 ghcr.io/surebeae/norlundcalc
-```
-
-Inside the container it listens on `0.0.0.0:8080`. `-p 8080:8080` publishes it to the network instead of only the local machine. Arguments after the image name replace `--listen 0.0.0.0:8080`.
-
 ### As CGI
 
 With `GATEWAY_INTERFACE` set, it answers one request from `QUERY_STRING` and `REQUEST_METHOD` on stdout and exits, so any CGI server can run it. Nothing is kept between requests, so the image and each download compute again.
@@ -478,7 +472,7 @@ exec wasmtime run --env "GATEWAY_INTERFACE=$GATEWAY_INTERFACE" --env "REQUEST_ME
 
 ## Compilation
 
-Each [release](https://github.com/surebeae/norlundcalc/releases) has `norlundcalc-cli` and `norlundcalc-web` built for Linux (static musl binaries, which also run on glibc systems) on x86_64 and aarch64, Windows x86_64, and macOS on aarch64 and x86_64, with a `SHA256SUMS` file. To build them yourself:
+Each future [release](https://github.com/surebeae/norlundcalc/releases) will have `norlundcalc-cli` and `norlundcalc-web` built for Linux (static musl binaries, which also run on glibc systems) on x86_64 and aarch64, Windows x86_64, and macOS on aarch64 and x86_64, with a `SHA256SUMS` file. To build them yourself:
 
 ```
 git clone https://github.com/surebeae/norlundcalc
@@ -552,7 +546,7 @@ Resonance occurs at exponential type $\tau/S$ ($\pi/S$ for the mean). A pure ton
 
 ## Limitations
 
-- **No seed anywhere.** Every construction starts from one seed strip of width $S$, cut-free or on a cut with a constant sheet change. A summand whose singular points are closer than $S$ along the whole axis, or whose cuts along the axis change sheet by a non-constant factor (such as $e^{\sqrt z}$), has none.
+- **No seed anywhere.** Every construction starts from one seed strip of width $S$, cut-free or on a cut with a constant sheet change. A summand has none if every vertical strip of width $S$ holds a singular point (such as $\tan \pi z$ with $S = 1$, whose poles are exactly $S$ apart), or if cuts cover the whole axis and change sheet by neither a constant factor nor a constant offset (such as $e^{\sqrt z} + e^{\sqrt{-z}}$). The search tries $h$ at sample points, so it can miss a seed that exists only in a narrow window: for $\tan(\pi z/1.01)$, whose poles are $1.01$ apart, it finds none.
 - **Complex steps.** $S$ is real and positive. For $S = |S|e^{i\theta}$, sum $g(w) = f(e^{i\theta}w)$ with step $|S|$ and set $F(z) = G(e^{-i\theta}z)$; strips and exponential type rotate with the step.
 - **Orders above 1** need a valid seed strip; residue-sum strips are order 1 only.
 - **Closed forms** for logarithms and non-polynomial powers are real-only; with one present, complex evaluation sums the whole expression by Abel–Plana, which needs type below $\tau/S$.
